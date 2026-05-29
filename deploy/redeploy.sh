@@ -21,6 +21,16 @@ echo "==> pip install"
 echo "==> predownload model"
 .venv/bin/python scripts/predownload_model.py
 
+echo "==> ensure Node.js 20"
+node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+if [ "$node_major" -lt 20 ]; then
+  echo "  installing Node.js 20 (current: $(node --version 2>/dev/null || echo none))"
+  apt-get remove -y -qq nodejs npm libnode-dev libnode72 2>/dev/null || true
+  apt-get autoremove -y -qq 2>/dev/null || true
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+  apt-get install -y -qq nodejs
+fi
+
 echo "==> npm ci + build"
 npm ci --silent
 npm run build
