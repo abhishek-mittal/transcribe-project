@@ -4,3 +4,7 @@ flask>=3.0.0
 gunicorn>=22.0.0
 av>=11.0.0
 huggingface_hub>=0.20.0
+# yt-dlp plugin: Proof-of-Origin token provider to bypass YouTube bot checks
+# from datacenter IPs. Auto-engages when installed; uses the Node helper
+# installed in deploy/setup.sh (npm i -g bgutil-ytdlp-pot-provider).
+bgutil-ytdlp-pot-provider>=0.6.0

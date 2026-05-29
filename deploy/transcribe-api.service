@@ -16,6 +16,7 @@ ExecStart=/opt/transcribe/.venv/bin/gunicorn \
 Restart=always
 RestartSec=5
 EnvironmentFile=/etc/environment
+EnvironmentFile=-/etc/transcribe/api.env
 
 [Install]
 WantedBy=multi-user.target

@@ -44,6 +44,10 @@ python3 -m venv .venv
 .venv/bin/pip install --quiet --upgrade pip
 .venv/bin/pip install --quiet -r requirements.txt
 
+echo "    Installing bgutil PO-token Node helper (global)..."
+npm install -g --silent bgutil-ytdlp-pot-provider 2>/dev/null || \
+  echo "    (warning: bgutil node helper install failed; PO tokens disabled)"
+
 echo "==> [3/7] Pre-downloading Whisper model: $WHISPER_MODEL"
 WHISPER_MODEL="$WHISPER_MODEL" .venv/bin/python scripts/predownload_model.py
 

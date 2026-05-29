@@ -20,6 +20,12 @@ echo "==> pip install"
 .venv/bin/pip install --quiet --upgrade pip
 .venv/bin/pip install --quiet -r requirements.txt
 
+echo "==> ensure bgutil PO-token Node helper"
+if ! command -v bgutil-pot-provider >/dev/null 2>&1; then
+  npm install -g --silent bgutil-ytdlp-pot-provider 2>/dev/null || \
+    echo "  (warning: bgutil node helper install failed; PO tokens disabled)"
+fi
+
 echo "==> predownload model"
 .venv/bin/python scripts/predownload_model.py
 
