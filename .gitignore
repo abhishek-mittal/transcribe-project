@@ -1,0 +1,42 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build output
+.svelte-kit/
+build/
+dist/
+.vercel/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+*.egg-info/
+.eggs/
+
+# Audio / transcript artifacts
+audio/
+*.mp3
+*.mp4
+*.wav
+*_transcript.txt
+*_timestamped.txt
+*_subtitles.srt
+
+# Whisper model cache
+~/.cache/huggingface/
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# Editor
+.DS_Store
+.idea/
+*.swp
+*.swo

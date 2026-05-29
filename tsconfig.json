@@ -1,0 +1,10 @@
+{
+  "compilerOptions": {
+    "extends": "./.svelte-kit/tsconfig.json",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "checkJs": true,
+    "strict": true
+  },
+  "include": ["src/**/*.d.ts", "src/**/*.ts", "src/**/*.js", "src/**/*.svelte"]
+}
