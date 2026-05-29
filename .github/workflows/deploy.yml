@@ -6,6 +6,11 @@
 #   VULTR_KNOWN_HOSTS    Output of `ssh-keyscan -t ed25519,rsa <VULTR_HOST>`
 # Optional:
 #   VULTR_SSH_USER       Defaults to "root"
+#   YT_DLP_COOKIES_B64   base64 (single line, no wrap) of a Netscape-format
+#                        YouTube cookies.txt. Generate with:
+#                          base64 -w0 cookies.txt | pbcopy
+#                        Written to /etc/transcribe/cookies/youtube.txt on the VPS
+#                        on every deploy. Leave unset to keep the existing file.
 name: CI / Deploy
 
 on:
@@ -55,6 +60,34 @@ jobs:
           chmod 600 ~/.ssh/id_deploy
           printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 644 ~/.ssh/known_hosts
+
+      - name: Sync YouTube cookies (optional)
+        env:
+          VULTR_HOST: ${{ secrets.VULTR_HOST }}
+          VULTR_SSH_USER: ${{ secrets.VULTR_SSH_USER || 'root' }}
+          YT_DLP_COOKIES_B64: ${{ secrets.YT_DLP_COOKIES_B64 }}
+        run: |
+          if [ -z "${YT_DLP_COOKIES_B64}" ]; then
+            echo "YT_DLP_COOKIES_B64 not set; leaving existing cookies file untouched."
+            exit 0
+          fi
+          # Pipe base64 over SSH; decode and install on the VPS without ever
+          # writing the plaintext to the runner's disk.
+          printf '%s' "${YT_DLP_COOKIES_B64}" | ssh -i ~/.ssh/id_deploy \
+              -o UserKnownHostsFile=~/.ssh/known_hosts \
+              -o StrictHostKeyChecking=yes \
+              "${VULTR_SSH_USER}@${VULTR_HOST}" \
+              'set -euo pipefail; \
+               install -d -o root -g www-data -m 750 /etc/transcribe/cookies; \
+               umask 027; \
+               tmp=$(mktemp /etc/transcribe/cookies/youtube.txt.XXXXXX); \
+               base64 -d > "$tmp"; \
+               chown root:www-data "$tmp"; \
+               chmod 640 "$tmp"; \
+               mv "$tmp" /etc/transcribe/cookies/youtube.txt; \
+               head -1 /etc/transcribe/cookies/youtube.txt | grep -q Netscape \
+                 || { echo "cookies.txt is not Netscape format" >&2; exit 1; }; \
+               echo "cookies installed: $(wc -l < /etc/transcribe/cookies/youtube.txt) lines"'
 
       - name: Redeploy on VPS
         env:
