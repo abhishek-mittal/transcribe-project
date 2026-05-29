@@ -79,9 +79,11 @@ resource "vultr_instance" "transcribe" {
     apt-get install -y -qq \
       git curl ffmpeg \
       python3-pip python3-venv \
-      nodejs npm \
       nginx \
       certbot python3-certbot-nginx
+    # Node.js 20 from NodeSource (Ubuntu 22.04 ships Node 12 which is too old for Vite)
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+    apt-get install -y -qq nodejs
     echo "WHISPER_MODEL=${var.whisper_model}" >> /etc/environment
     echo "LOG_LEVEL=INFO" >> /etc/environment
   EOT

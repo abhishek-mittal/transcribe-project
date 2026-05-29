@@ -19,9 +19,20 @@ if [ -z "$REPO_URL" ]; then
   exit 1
 fi
 
+echo "==> [0/7] Ensuring Node.js 20+ is installed..."
+NODE_MAJOR="$(node --version 2>/dev/null | sed -E 's/^v([0-9]+).*/\1/' || echo 0)"
+if [ "${NODE_MAJOR:-0}" -lt 20 ]; then
+  echo "    Installing Node.js 20 from NodeSource (current: ${NODE_MAJOR:-none})..."
+  apt-get remove -y -qq nodejs npm libnode-dev libnode72 >/dev/null 2>&1 || true
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+  apt-get install -y -qq nodejs
+fi
+echo "    node $(node --version) / npm $(npm --version)"
+
 echo "==> [1/7] Cloning / updating repository..."
 if [ -d "$APP_DIR/.git" ]; then
-  git -C "$APP_DIR" pull --ff-only
+  git -C "$APP_DIR" fetch --quiet origin
+  git -C "$APP_DIR" reset --hard origin/main
 else
   git clone "$REPO_URL" "$APP_DIR"
 fi
