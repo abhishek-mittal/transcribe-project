@@ -10,6 +10,8 @@ APP_DIR="${APP_DIR:-/opt/transcribe}"
 
 cd "$APP_DIR"
 
+git config --global --add safe.directory "$APP_DIR"
+
 echo "==> git pull"
 git fetch --quiet origin
 git reset --hard origin/main
