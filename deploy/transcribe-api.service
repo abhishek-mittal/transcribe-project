@@ -1,0 +1,21 @@
+[Unit]
+Description=Transcribe API (Flask + faster-whisper + yt-dlp)
+After=network.target
+
+[Service]
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/transcribe
+ExecStart=/opt/transcribe/.venv/bin/gunicorn \
+    --workers 2 \
+    --bind 127.0.0.1:8000 \
+    --timeout 300 \
+    --access-logfile - \
+    --error-logfile - \
+    api.transcribe:app
+Restart=always
+RestartSec=5
+EnvironmentFile=/etc/environment
+
+[Install]
+WantedBy=multi-user.target

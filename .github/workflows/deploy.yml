@@ -1,0 +1,84 @@
+# CI on every push/PR; deploy to the Vultr VPS on push to main.
+#
+# Required GitHub repository secrets:
+#   VULTR_HOST           Public IPv4 of the VPS (from `terraform output vps_ip`)
+#   VULTR_SSH_KEY        Private SSH key (PEM) whose public key is on the VPS
+#   VULTR_KNOWN_HOSTS    Output of `ssh-keyscan -t ed25519,rsa <VULTR_HOST>`
+# Optional:
+#   VULTR_SSH_USER       Defaults to "root"
+name: CI / Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build & type-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check
+        run: npm run check
+
+      - name: Build
+        run: npm run build
+
+  deploy:
+    name: Deploy to Vultr VPS
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: vultr-deploy
+      cancel-in-progress: false
+    steps:
+      - name: Configure SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.VULTR_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.VULTR_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Redeploy on VPS
+        env:
+          VULTR_HOST: ${{ secrets.VULTR_HOST }}
+          VULTR_SSH_USER: ${{ secrets.VULTR_SSH_USER || 'root' }}
+        run: |
+          ssh -i ~/.ssh/id_deploy \
+              -o UserKnownHostsFile=~/.ssh/known_hosts \
+              -o StrictHostKeyChecking=yes \
+              "${VULTR_SSH_USER}@${VULTR_HOST}" \
+              'bash /opt/transcribe/deploy/redeploy.sh'
+
+      - name: Health check
+        env:
+          VULTR_HOST: ${{ secrets.VULTR_HOST }}
+        run: |
+          for i in 1 2 3 4 5; do
+            if curl -fsS --max-time 10 "http://${VULTR_HOST}/api/health"; then
+              echo
+              echo "ok: healthy"
+              exit 0
+            fi
+            echo "attempt $i failed, retrying..."
+            sleep 5
+          done
+          echo "fail: health check failed"
+          exit 1

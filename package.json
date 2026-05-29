@@ -5,15 +5,20 @@
   "type": "module",
   "scripts": {
     "dev": "vite dev",
+    "dev:api": "./.venv/bin/python scripts/dev_api.py",
+    "dev:all": "concurrently -k -n web,api -c cyan,magenta \"npm:dev\" \"npm:dev:api\"",
+    "predownload:model": "./.venv/bin/python scripts/predownload_model.py",
     "build": "vite build",
+    "start": "node build",
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch"
   },
   "devDependencies": {
-    "@sveltejs/adapter-vercel": "^5.0.0",
+    "@sveltejs/adapter-node": "^5.5.4",
     "@sveltejs/kit": "^2.0.0",
     "@sveltejs/vite-plugin-svelte": "^3.0.0",
+    "concurrently": "^9.2.1",
     "svelte": "^4.0.0",
     "svelte-check": "^3.0.0",
     "typescript": "^5.0.0",

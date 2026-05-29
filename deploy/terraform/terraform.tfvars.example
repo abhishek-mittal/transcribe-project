@@ -1,0 +1,10 @@
+# Copy to terraform.tfvars and fill in your values.
+# terraform.tfvars is gitignored — never commit your API key.
+
+vultr_api_key = "your-vultr-api-key-here"
+region        = "ewr"
+plan          = "vc2-1c-2gb"
+ssh_key_ids   = [] # find IDs in Vultr console > Account > SSH Keys
+repo_url      = "https://github.com/abhishek-mittal/shuhari.git"
+whisper_model = "tiny"
+domain        = "" # e.g. "transcribe.example.com" — leave empty for HTTP-only

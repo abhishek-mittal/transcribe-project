@@ -1,9 +1,0 @@
-{
-  "framework": "sveltekit",
-  "functions": {
-    "api/transcribe.py": {
-      "runtime": "python3.12",
-      "maxDuration": 300
-    }
-  }
-}

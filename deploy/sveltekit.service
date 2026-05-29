@@ -1,0 +1,16 @@
+[Unit]
+Description=SvelteKit Frontend (adapter-node)
+After=network.target
+
+[Service]
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/transcribe
+ExecStart=/usr/bin/node build
+Restart=always
+RestartSec=5
+Environment=PORT=3000
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,420 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "rna-pluribus-schema-v1",
+  "title": "RNA + Pluribus Agent Collective Schema",
+  "description": "Platform-neutral schema for defining multi-agent orchestration with Reusable Neural Activators (RNA). This schema is the canonical format; per-platform adapters generate native configuration files.",
+  "version": "1.0.0",
+  "rnaVersion": "1.2.0",
+  "meta": {
+    "director": "Director",
+    "projectName": "transcribe-project",
+    "description": "Web app that transcribes audio from URLs using yt-dlp + faster-whisper (Python API) with a SvelteKit/TypeScript frontend, deployed to Vercel.",
+    "domain": "web-app",
+    "stack": {
+      "language": "Python + TypeScript",
+      "framework": "SvelteKit + Python serverless",
+      "extras": ["faster-whisper", "yt-dlp", "Vite", "@sveltejs/adapter-vercel"]
+    },
+    "deploymentTarget": "vercel",
+    "triggerPrefix": "/",
+    "platform": "copilot",
+    "generatedAt": "2026-05-29T18:02:07.576Z"
+  },
+  "outputFormat": "verbose",
+  "resilience": {
+    "enabled": true,
+    "maxRetries": 3,
+    "failureLogDir": "_memory/failures/"
+  },
+  "lifecycle": {
+    "onSessionStart": [
+      "load-progressive-context",
+      "check-pending-signals"
+    ],
+    "onToolComplete": [
+      "capture-observation"
+    ],
+    "onSessionEnd": [
+      "compress-observations",
+      "write-session-log",
+      "update-timeline"
+    ]
+  },
+  "obsidian": {
+    "enabled": false,
+    "vaultRoot": "_memory/",
+    "wikilinks": true
+  },
+  "registry": "registry/capabilities.csv",
+  "agents": [
+    {
+      "id": "developer",
+      "name": "Developer",
+      "role": "Full-Stack Developer",
+      "persona": "Focused, productive, pattern-aware implementer",
+      "command": "/dev",
+      "model": "balanced",
+      "triggerEvents": [
+        "entry-created"
+      ],
+      "matchCategories": [
+        "sprint",
+        "blocker"
+      ],
+      "matchPriorities": [
+        "critical",
+        "high",
+        "medium"
+      ],
+      "capabilities": [
+        "implement",
+        "code-generation",
+        "api",
+        "frontend"
+      ],
+      "autoActivate": false,
+      "systemPrompt": "You are the Developer agent. Build features, APIs, and frontend components following the project development standards. Stack: Python serverless API (yt-dlp + faster-whisper) and SvelteKit/TypeScript frontend deployed to Vercel."
+    },
+    {
+      "id": "reviewer",
+      "name": "Reviewer",
+      "role": "Code Reviewer & Quality Gate",
+      "persona": "Pragmatic, security-conscious, evidence-driven",
+      "command": "/review",
+      "model": "balanced",
+      "triggerEvents": [
+        "entry-updated",
+        "post-commit"
+      ],
+      "matchCategories": [
+        "dod",
+        "review"
+      ],
+      "matchPriorities": [
+        "critical",
+        "high",
+        "medium"
+      ],
+      "capabilities": [
+        "review",
+        "security-gate",
+        "testing-standards",
+        "pr-description"
+      ],
+      "autoActivate": false,
+      "systemPrompt": "You are the Reviewer agent. Enforce the security gate, testing standards, and PR description rules before merge."
+    },
+    {
+      "id": "architect",
+      "name": "Architect",
+      "role": "System Architect & Optimization Lead",
+      "persona": "Measure-first, trade-off-aware, minimal-abstraction",
+      "command": "/arch",
+      "model": "balanced",
+      "triggerEvents": [
+        "entry-created"
+      ],
+      "matchCategories": [
+        "design",
+        "optimization"
+      ],
+      "matchPriorities": [
+        "critical",
+        "high"
+      ],
+      "capabilities": [
+        "design",
+        "optimization-workflow",
+        "trade-off-analysis"
+      ],
+      "autoActivate": false,
+      "systemPrompt": "You are the Architect agent. Own design decisions and the 6-phase optimization workflow. Measure before optimizing."
+    },
+    {
+      "id": "director",
+      "name": "Director",
+      "role": "Routing & Orchestration",
+      "persona": "Concise router; delegates to the right agent",
+      "command": "/director",
+      "model": "fast",
+      "triggerEvents": [
+        "entry-created"
+      ],
+      "matchCategories": [
+        "blocker",
+        "sprint",
+        "design",
+        "dod"
+      ],
+      "matchPriorities": [
+        "critical",
+        "high",
+        "medium",
+        "low"
+      ],
+      "capabilities": [
+        "route",
+        "orchestrate",
+        "approve"
+      ],
+      "autoActivate": true,
+      "systemPrompt": "You are the Director. Match incoming signals to the right agent (developer, reviewer, architect) and approve gated hooks."
+    }
+  ],
+  "rules": [
+    {
+      "id": "development-standards",
+      "name": "Development Standards",
+      "alwaysApply": true,
+      "description": "Core coding guidelines: simplicity, readability, minimal changes, anti-patterns",
+      "ownedBy": null,
+      "content": "Write simple, readable code. Use early returns. Minimal diffs — change only what the task requires. DRY principle. Prefix event handlers with 'handle'. Document public functions with JSDoc."
+    },
+    {
+      "id": "context-router",
+      "name": "Context Router",
+      "alwaysApply": true,
+      "description": "Always-on intent router matching prompts to rules, skills, and agents",
+      "ownedBy": "director",
+      "content": "Before responding, check if the request matches an existing rule, skill, or agent. Suggest the match to the user. Never mention the router when no match is found."
+    },
+    {
+      "id": "testing-standards",
+      "name": "Testing Standards",
+      "alwaysApply": false,
+      "description": "Test creation standards for the project test framework",
+      "ownedBy": "reviewer",
+      "triggerKeywords": [
+        "test",
+        "spec",
+        "coverage",
+        "unit test",
+        "integration test"
+      ],
+      "content": "# Coding Standards\n\nThese rules apply to all code changes across all contributors and agents in this project.\n\n---\n\n## Code Quality\n\n- **Early returns over nested conditionals.** Fail fast; happy path last.\n- **DRY principle.** No copy-pasted logic. Extract shared logic into a shared utility module.\n- **Minimal diffs.** Change only what is required by the task. Do not silently refactor adjacent code.\n- **JSDoc on all public functions.** Single-line `/** ... */` is sufficient for simple functions. Required for all exported functions in `lib/` and `api/`.\n- **Event handler naming:** prefix with `handle` — e.g. `handleSave`, `handleKeyDown`.\n\n---\n\n## TypeScript\n\n- Strict mode throughout. No `any`, no `@ts-ignore` without an explanatory comment.\n- Prefer `type` over `interface` for plain data shapes.\n- Use `unknown` instead of `any` for external data; narrow with Zod or type guards.\n- No implicit `any` via untyped exports.\n\n---\n\n## Error Handling\n\n- API routes: return `{ error: string }` with appropriate HTTP status codes.\n- UI: surface user-friendly messages; never display raw error objects.\n- `console.error` in dev only — remove all debug logs before committing.\n- Handle all `Promise` rejections; no floating `async` calls without `await` or `.catch()`.\n\n---\n\n## Naming Conventions\n\n- Filenames: `lowercase-kebab-case` everywhere.\n- Variables and functions: `camelCase`.\n- Types and classes: `PascalCase`.\n- Constants: `SCREAMING_SNAKE_CASE` for module-level constants.\n- Test files: mirror source tree — `lib/__tests__/utils.test.ts` for `lib/utils.ts`.\n\n---\n\n## Commit Hygiene\n\nEvery commit message must follow:\n\n```\n<type>(<scope>): <short description>\n\n[optional body]\n```\n\nTypes: `feat` `fix` `refactor` `docs` `test` `chore` `style`\nScope: the affected module (e.g. `api/save`, `components/ui`, `lib/content`)\n\nExamples:\n- `feat(api/users): add pagination support`\n- `fix(components/nav): correct active link state`\n- `chore(deps): update dependencies`\n\n---\n\n## Session Memory Update\n\nAt the end of every coding session, update `_memory/rna-method/timeline.json`:\n- Mark resolved signals as complete\n- Add new signals or open questions discovered during the session\n- Note the exact stopping point if work is incomplete"
+    },
+    {
+      "id": "security-gate",
+      "name": "Security Gate",
+      "alwaysApply": false,
+      "description": "Security checklist: no hardcoded secrets, input validation, injection prevention",
+      "ownedBy": "reviewer",
+      "triggerKeywords": [
+        "security",
+        "auth",
+        "credential",
+        "secret",
+        "vulnerability",
+        "injection"
+      ],
+      "content": "# Security Gate\n\nThis rule is evaluated by **@reviewer** before approving any pull request.\n\n---\n\n## Mandatory Security Checks\n\n### Secrets and Credentials\n- [ ] No API keys, passwords, tokens, or private keys in any committed file\n- [ ] No hardcoded environment-specific values (URLs, database names, account IDs)\n- [ ] `.env` files are in `.gitignore`\n- [ ] Any CI/CD credentials are stored as encrypted secrets, not in source\n\n**If a secret was accidentally committed:**\n1. Rotate the credential immediately — do not wait.\n2. Use `git filter-branch` or BFG Repo Cleaner to scrub history.\n3. Force push and notify all collaborators to re-clone.\n\n### Input Validation\n- [ ] All API route inputs validated with Zod (or equivalent schema validator)\n- [ ] File path inputs validated — no path traversal (`../`, `%2e%2e`)\n- [ ] No user-controlled data flows into `eval()`, `exec()`, `Function()`, or dynamic queries without sanitization\n\n### Authentication and Authorization\n- [ ] Authentication checked before data access on all protected routes\n- [ ] Authorization verified — user can only access their own resources\n- [ ] Session tokens have appropriate expiry\n- [ ] No authentication logic bypassed in \"dev mode\" paths that reach production\n\n### Dependency Safety\n- [ ] New dependencies reviewed for known vulnerabilities (Snyk or `npm audit`)\n- [ ] No `@latest` in `package.json` for production dependencies — pin major versions\n- [ ] No `postinstall` scripts from unverified packages\n\n### Error Handling\n- [ ] Error messages do not expose internal stack traces to end users\n- [ ] Error messages do not expose schema or file structure\n- [ ] 500 responses return `{ error: \"Internal server error\" }` — not the raw exception\n\n---\n\n## Severity Guide for Review Comments\n\n| Severity | Label | Merge Policy |\n|---|---|---|\n| P0 — Security | BLOCKER | Must fix before merge |\n| P1 — Correctness | REQUEST_CHANGES | Must fix before merge |\n| P2 — Standards | WARNING | Should fix; merge with tracking |\n| P3 — Quality | SUGGESTION | Optional; at author's discretion |\n\n---\n\n## Snyk Scan Requirement\n\nAll new first-party code must be scanned with Snyk before merge:\n\n```bash\n# Code scan\nsnyk code test --severity-threshold=high\n\n# Dependency scan\nsnyk test --severity-threshold=high\n```\n\nA clean Snyk scan (no high/critical issues) is required. Medium issues require a documented decision."
+    },
+    {
+      "id": "optimization-workflow",
+      "name": "Optimization Workflow",
+      "alwaysApply": false,
+      "description": "Systematic 6-phase code optimization: measure first, no premature optimization",
+      "ownedBy": "architect",
+      "triggerKeywords": [
+        "optimize",
+        "performance",
+        "benchmark",
+        "slow",
+        "latency"
+      ],
+      "content": "# Optimization Workflow\n\nThis rule defines the mandatory process for any optimization or performance work.\n\n---\n\n## Golden Rule\n\n**Measure first, optimize second.** No optimization without a baseline measurement and a clear target metric.\n\n---\n\n## 6-Phase Process\n\n### Phase 1 — Define the Problem\n- State the performance symptom (e.g. \"page load takes 4.2s, target is < 1.5s\")\n- Identify the metric: latency, throughput, memory, bundle size, or other\n- Set a measurable success target\n\n### Phase 2 — Measure Baseline\n- Profile with appropriate tools (DevTools, Lighthouse, `perf_hooks`, database EXPLAIN)\n- Record baseline numbers in a reproducible environment\n- Identify the bottleneck — do not guess\n\n### Phase 3 — Analyze Root Cause\n- Trace the hot path through the bottleneck\n- Categorize: algorithmic, I/O, rendering, network, or resource\n- Document the root cause before proposing solutions\n\n### Phase 4 — Implement Fix\n- Address only the identified bottleneck — one concern at a time\n- Keep diffs minimal and reversible\n- Add inline comments explaining \"why\" for non-obvious optimizations\n\n### Phase 5 — Measure Result\n- Re-measure using the same environment and tools as Phase 2\n- Compare against baseline and target\n- If the target is not met, return to Phase 3\n\n### Phase 6 — Document\n- Record the optimization as an ADR or session log entry\n- Include: before/after metrics, root cause, solution, and trade-offs\n- Update `timeline.json` with the decision\n\n---\n\n## Anti-Patterns\n\n- **Premature optimization:** Optimizing code without evidence of a problem\n- **Micro-benchmarking in isolation:** Optimizing a function that accounts for < 1% of total time\n- **Optimizing readability away:** Sacrificing code clarity for marginal gains\n- **Caching without invalidation strategy:** Adding caches without a plan for staleness"
+    },
+    {
+      "id": "pr-description",
+      "name": "PR Description",
+      "alwaysApply": false,
+      "description": "Generate GitHub PR descriptions with What changed / Why / Testing evidence sections",
+      "ownedBy": "reviewer",
+      "triggerKeywords": [
+        "PR",
+        "pull request",
+        "merge",
+        "pr description"
+      ],
+      "content": "# Review Gate\n\nThese standards govern how pull requests are created and reviewed in this project.\n\n---\n\n## PR Description Template\n\nEvery pull request description must include all three sections:\n\n```markdown\n## What changed\n- `path/to/file.ts` — <what changed>\n- `path/to/other.ts` — <what changed>\n\n## Why\n<1–3 sentences explaining the business or technical reason>\n\n## Testing evidence\n<how this was verified — unit tests, manual steps, screenshots, or all>\n```\n\nPRs without all three sections should not be merged.\n\n---\n\n## Pre-Merge Checklist\n\nBefore approving, the reviewer verifies:\n\n- [ ] PR description has all three required sections\n- [ ] TypeScript compiles without errors\n- [ ] Tests pass (all existing tests green, new tests added for new behavior)\n- [ ] No `console.log()`, `debugger`, or TODO comments left in production paths\n- [ ] No hardcoded secrets or environment-specific values\n- [ ] Security gate checks passed (see `security-gate.md`)\n- [ ] API routes have Zod validation on all inputs\n- [ ] Error responses follow the project's shape: `{ error: string }`\n- [ ] JSDoc present on new public functions in `lib/` and `api/`\n\n---\n\n## Review Response Format\n\n```markdown\n## Review: <PR title>\n\n**Verdict:** APPROVE | REQUEST_CHANGES | NEEDS_DISCUSSION\n\n### Blockers (must fix before merge)\n- [ ] <issue> → <fix required>\n\n### Warnings (should fix)\n- <issue> → <suggestion>\n\n### Suggestions (optional)\n- <observation> → <recommendation>\n```\n\n---\n\n## Definition of Done (DoD)\n\nA task is considered **done** when all of the following are true:\n\n1. Feature or fix is implemented and tested.\n2. All existing tests still pass.\n3. TypeScript compiles without errors.\n4. PR is opened with complete description.\n5. Reviewer has approved (no open blockers).\n6. `_memory/rna-method/timeline.json` updated — signal resolved.\n\n---\n\n## Merge Policy\n\n- **Squash merge** preferred for feature PRs — keeps history clean.\n- **Merge commit** for long-running branches being merged back to main.\n- **No force-push to main** without notice to all active contributors.\n- **Revert immediately** if a merge causes test failures on main."
+    },
+    {
+      "id": "docs-standards",
+      "name": "Documentation Standards",
+      "alwaysApply": false,
+      "description": "Documentation standards: structure, epistemic labels, source requirements",
+      "ownedBy": null,
+      "triggerKeywords": [
+        "document",
+        "docs",
+        "readme",
+        "write up",
+        "spec"
+      ],
+      "content": "# Documentation Standards\n\nThese rules apply to all documentation files (`docs/`, `README.md`, `CHANGELOG.md`, agent files, rule files).\n\n---\n\n## Frontmatter (for `.md` and `.mdx` files in `docs/` and `content/`)\n\nRequired fields:\n```yaml\n---\ntitle: <human-readable title>\ndescription: <one-sentence summary>\ndate: YYYY-MM-DD\nstatus: draft | review | published\n---\n```\n\nOptional fields:\n```yaml\ntags: [tag1, tag2]\nrelated: [path/to/related.md]\n```\n\n---\n\n## README.md Requirements\n\nEvery module, package, or sub-directory with significant logic must have a `README.md` with:\n\n1. **Purpose** — one paragraph explaining what this module does.\n2. **Usage** — a working code example or CLI invocation.\n3. **API** (if applicable) — key exports with their signatures and purpose.\n4. **Configuration** — any environment variables or config files.\n\n---\n\n## JSDoc Standards\n\nRequired on all exported functions in `lib/` and `api/`:\n\n```typescript\n/**\n * Loads a content file and returns its parsed frontmatter and body.\n * @param filePath - Absolute path to the `.md` or `.mdx` file.\n * @returns ContentFile with `meta` and `content` fields, or throws if not found.\n */\nexport async function loadContent(filePath: string): Promise<ContentFile> { ... }\n```\n\n- Use `@param` for each parameter.\n- Use `@returns` to describe the return value.\n- Use `@throws` if the function throws in known conditions.\n- Single-line `/** ... */` is acceptable for trivial functions.\n\n---\n\n## CHANGELOG.md Format\n\nFollow [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) — semver grouping:\n\n```markdown\n## [1.2.0] — YYYY-MM-DD\n### Added\n- New feature description\n\n### Changed\n- What was modified\n\n### Fixed\n- Bug fixed\n\n### Removed\n- What was removed\n\n### Deprecated\n- What is being deprecated and when it will be removed\n```\n\n---\n\n## Documentation Freshness\n\n- API route documentation must be updated when the route changes.\n- Agent files must be updated when agent responsibilities change.\n- Schema reference must be updated with every schema version bump.\n- README examples must be tested against the current codebase — no stale examples.\n\n---\n\n## Prohibited Documentation Patterns\n\n- **Vague descriptions:** \"handles stuff\" or \"does things\" — be specific.\n- **Stale examples:** code samples that are not runnable against the current API.\n- **Summary-only files:** Do not create `CHANGES.md`, `SUMMARY.md`, or catch-all doc files unless explicitly requested.\n- **Undated entries:** Every doc change should have a date or be tied to a version."
+    }
+  ],
+  "skills": [
+    {
+      "id": "smart-dev-agent",
+      "name": "Smart Dev Agent",
+      "description": "Context-aware lead developer with phased workflow: context load from timeline.json, ticket triage, model selection, implementation, then hub update",
+      "ownedBy": "developer",
+      "triggerKeywords": [
+        "implement",
+        "build",
+        "fix",
+        "debug",
+        "optimize",
+        "refactor"
+      ],
+      "subFiles": [
+        "context-loader.md",
+        "model-selection.md"
+      ]
+    },
+    {
+      "id": "design-quality",
+      "name": "Design Quality",
+      "description": "Impeccable-style design audit: audit, normalize, polish, critique, distill, harden commands for UI/UX quality",
+      "ownedBy": "developer",
+      "triggerKeywords": [
+        "audit UI",
+        "normalize",
+        "polish",
+        "critique",
+        "distill",
+        "harden",
+        "design quality"
+      ],
+      "subFiles": [
+        "design-quality-commands.md"
+      ]
+    }
+  ],
+  "commands": [
+    {
+      "id": "dev",
+      "agentId": "developer",
+      "description": "Invoke Developer agent"
+    },
+    {
+      "id": "review",
+      "agentId": "reviewer",
+      "description": "Invoke Reviewer agent"
+    },
+    {
+      "id": "arch",
+      "agentId": "architect",
+      "description": "Invoke Architect agent"
+    },
+    {
+      "id": "director",
+      "agentId": "director",
+      "description": "Invoke Director (routing/orchestration)"
+    }
+  ],
+  "hooks": [
+    {
+      "id": "post-commit-review",
+      "event": "post-commit",
+      "description": "Auto-trigger code review signal after git commit",
+      "activates": [
+        "reviewer"
+      ],
+      "directorApproval": true,
+      "enabled": false
+    },
+    {
+      "id": "pre-push-qa",
+      "event": "pre-push",
+      "description": "Auto-trigger a quick check signal before git push",
+      "activates": [
+        "reviewer"
+      ],
+      "directorApproval": true,
+      "enabled": false
+    },
+    {
+      "id": "rna-updated-validate",
+      "event": "rna-updated",
+      "description": "Auto-validate registry when RNA files change",
+      "activates": [
+        "validate-registry"
+      ],
+      "directorApproval": false,
+      "enabled": true
+    },
+    {
+      "id": "on-session-start",
+      "event": "session-start",
+      "description": "Inject progressive context index at session start",
+      "activates": [
+        "load-progressive-context"
+      ],
+      "directorApproval": false,
+      "enabled": true
+    },
+    {
+      "id": "on-tool-complete",
+      "event": "tool-complete",
+      "description": "Capture observation after tool executions (async, non-blocking)",
+      "activates": [
+        "capture-observation"
+      ],
+      "directorApproval": false,
+      "enabled": false
+    },
+    {
+      "id": "on-session-end",
+      "event": "session-end",
+      "description": "Compress observations and write session log at session close",
+      "activates": [
+        "compress-observations"
+      ],
+      "directorApproval": false,
+      "enabled": true
+    }
+  ],
+  "routes": [
+    {
+      "id": "route-critical-blocker",
+      "when": {
+        "event": "entry-created",
+        "category": "blocker",
+        "priority": "critical"
+      },
+      "activate": [
+        "director"
+      ],
+      "directorApproval": false
+    },
+    {
+      "id": "route-sprint-task",
+      "when": {
+        "event": "entry-created",
+        "category": "sprint",
+        "priority": [
+          "critical",
+          "high"
+        ]
+      },
+      "activate": [
+        "developer"
+      ],
+      "directorApproval": true
+    },
+    {
+      "id": "route-dod-complete",
+      "when": {
+        "event": "entry-updated",
+        "category": "dod"
+      },
+      "activate": [
+        "reviewer"
+      ],
+      "directorApproval": true
+    }
+  ],
+  "joiningPatterns": []
+}

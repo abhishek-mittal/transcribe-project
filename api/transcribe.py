@@ -1,26 +1,88 @@
-import json
+"""Flask API for the transcribe-project.
+
+Runs under Gunicorn on the Vultr VPS (see deploy/transcribe-api.service).
+Local dev: `python scripts/dev_api.py` (Vite proxies /api/* to it).
+"""
+
+import logging
 import os
+import shutil
 import tempfile
+import time
 import traceback
-from http.server import BaseHTTPRequestHandler
+import uuid
 from datetime import timedelta
 
 import yt_dlp
 from faster_whisper import WhisperModel
+from flask import Flask, jsonify, request
 
 
 # ---------------------------------------------------------------------------
-# NOTE ON VERCEL LIMITS
+# Configuration
 # ---------------------------------------------------------------------------
-# Vercel serverless functions have a max execution time of 60s (Pro) / 10s (Hobby).
-# faster-whisper models range from ~150MB (small) to ~3GB (large-v3).
-# For production use with longer videos, consider:
-#   - A dedicated server (Railway, Fly.io, Render)
-#   - Async job queue (e.g. Vercel + upstash + worker)
-#   - A managed speech API (Deepgram, AssemblyAI) as a lighter alternative
-# ---------------------------------------------------------------------------
+# Model is controlled by the WHISPER_MODEL env var on the VPS.
+# 2 GB VPS: tiny (~75 MB) or base (~141 MB) are safe.
+# 4 GB+ VPS: small (~480 MB) is viable.
+VALID_MODELS = {"tiny", "base", "small"}
+DEFAULT_MODEL = os.environ.get("WHISPER_MODEL", "tiny")
 
-VALID_MODELS = {"small", "medium", "large-v3-turbo", "large-v3"}
+# Pre-downloaded model weights live here (populated by scripts/predownload_model.py).
+# Each model lives in its own subdirectory: api/_models/<model_name>/.
+MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_models")
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+_LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=_LOG_LEVEL,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+logger = logging.getLogger("transcribe")
+
+
+# ---------------------------------------------------------------------------
+# Flask app
+# ---------------------------------------------------------------------------
+app = Flask(__name__)
+
+# Cache loaded WhisperModel instances by (size, device, compute_type).
+# Gunicorn workers are long-lived, so this avoids reloading on every request.
+_MODEL_CACHE: dict[tuple[str, str, str], WhisperModel] = {}
+
+
+def _resolve_model_source(model_size: str) -> str:
+    """Return a local directory if pre-downloaded, else the bare model name."""
+    local = os.path.join(MODELS_DIR, model_size)
+    if os.path.isfile(os.path.join(local, "model.bin")):
+        return local
+    return model_size
+
+
+def _get_model(model_size: str, device: str = "cpu", compute_type: str = "int8") -> WhisperModel:
+    key = (model_size, device, compute_type)
+    model = _MODEL_CACHE.get(key)
+    if model is None:
+        logger.info(
+            "Loading WhisperModel size=%s device=%s compute_type=%s (cache miss)",
+            model_size, device, compute_type,
+        )
+        load_start = time.perf_counter()
+        source = _resolve_model_source(model_size)
+        model = WhisperModel(source, device=device, compute_type=compute_type)
+        _MODEL_CACHE[key] = model
+        logger.info(
+            "WhisperModel loaded size=%s source=%s in %.2fs",
+            model_size,
+            "bundled" if source != model_size else "hf-hub",
+            time.perf_counter() - load_start,
+        )
+    else:
+        logger.debug("WhisperModel cache hit size=%s", model_size)
+    return model
 
 
 def format_timestamp(seconds: float) -> str:
@@ -38,7 +100,14 @@ def format_srt_timestamp(seconds: float) -> str:
 
 
 def download_audio(url: str, output_dir: str) -> str:
-    ydl_opts = {
+    logger.info("download_audio start url=%s", url)
+    download_start = time.perf_counter()
+
+    # YouTube's n-challenge (URL deobfuscation) requires a JS runtime since
+    # yt-dlp 2025. Node.js is installed on the VPS so this will always be
+    # available. Locally we fall through gracefully if absent.
+    node_path = shutil.which("node")
+    ydl_opts: dict = {
         "format": "bestaudio/best",
         "outtmpl": os.path.join(output_dir, "%(id)s.%(ext)s"),
         "quiet": True,
@@ -50,28 +119,37 @@ def download_audio(url: str, output_dir: str) -> str:
                 "preferredquality": "128",
             }
         ],
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            )
-        },
     }
+    if node_path:
+        ydl_opts["js_runtimes"] = {"node": {"path": node_path}}
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         audio_file = ydl.prepare_filename(info)
         if not audio_file.endswith(".mp3"):
             audio_file = os.path.splitext(audio_file)[0] + ".mp3"
-        return audio_file
+
+    size_bytes = os.path.getsize(audio_file) if os.path.exists(audio_file) else 0
+    logger.info(
+        "download_audio done id=%s elapsed_s=%.2f size_kb=%.1f",
+        info.get("id", "?"),
+        time.perf_counter() - download_start,
+        size_bytes / 1024,
+    )
+    return audio_file
 
 
 def transcribe_audio(audio_path: str, model_size: str, use_timestamps: bool) -> dict:
-    model = WhisperModel(model_size, device="cpu", compute_type="int8")
+    logger.info(
+        "transcribe_audio start path=%s model=%s timestamps=%s",
+        audio_path, model_size, use_timestamps,
+    )
+    transcribe_start = time.perf_counter()
+
+    model = _get_model(model_size)
     segments, info = model.transcribe(
         audio_path,
-        beam_size=5,
+        beam_size=1,
         word_timestamps=use_timestamps,
         vad_filter=True,
         language=None,
@@ -96,6 +174,11 @@ def transcribe_audio(audio_path: str, model_size: str, use_timestamps: bool) -> 
         end_str = format_srt_timestamp(segment.end)
         srt_parts.append(f"{i}\n{start_str} --> {end_str}\n{text}\n")
 
+    logger.info(
+        "transcribe_audio done language=%s segments=%d elapsed_s=%.2f",
+        info.language, len(plain_lines), time.perf_counter() - transcribe_start,
+    )
+
     return {
         "language": info.language,
         "plain": "\n".join(plain_lines),
@@ -104,63 +187,69 @@ def transcribe_audio(audio_path: str, model_size: str, use_timestamps: bool) -> 
     }
 
 
-class handler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        try:
-            content_length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_length)
-            data = json.loads(body)
+@app.after_request
+def add_cors_headers(response):
+    """Allow cross-origin requests in local dev (Vite on :5173, API on :8787).
+    In production both are served from the same Nginx origin so CORS is a no-op."""
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return response
 
-            url = data.get("url", "").strip()
-            model_size = data.get("model", "small")
-            use_timestamps = bool(data.get("timestamps", True))
 
-            if not url:
-                return self._send_json(400, {"error": "url is required"})
+@app.route("/api/transcribe", methods=["POST", "OPTIONS"])
+def handle_transcribe():
+    if request.method == "OPTIONS":
+        return "", 204
 
-            if model_size not in VALID_MODELS:
-                return self._send_json(
-                    400,
-                    {"error": f"Invalid model. Valid options: {sorted(VALID_MODELS)}"},
-                )
+    request_id = uuid.uuid4().hex[:8]
+    request_start = time.perf_counter()
+    url = ""
+    model_size = "?"
 
-            with tempfile.TemporaryDirectory() as tmp_dir:
-                audio_path = download_audio(url, tmp_dir)
-                result = transcribe_audio(audio_path, model_size, use_timestamps)
+    try:
+        data = request.get_json(force=True, silent=True) or {}
 
-            self._send_json(200, result)
+        url = (data.get("url") or "").strip()
+        model_size = data.get("model", DEFAULT_MODEL)
+        use_timestamps = bool(data.get("timestamps", True))
 
-        except json.JSONDecodeError:
-            self._send_json(400, {"error": "Invalid JSON body"})
-        except Exception as e:
-            self._send_json(
-                500,
-                {
-                    "error": str(e),
-                    "trace": traceback.format_exc(),
-                },
-            )
+        logger.info(
+            "POST /api/transcribe rid=%s model=%s timestamps=%s url=%s",
+            request_id, model_size, use_timestamps, url or "<missing>",
+        )
 
-    def do_OPTIONS(self):
-        """Handle CORS preflight requests."""
-        self.send_response(200)
-        self._add_cors_headers()
-        self.end_headers()
+        if not url:
+            return jsonify({"error": "url is required"}), 400
 
-    def _send_json(self, status: int, data: dict):
-        body = json.dumps(data).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self._add_cors_headers()
-        self.end_headers()
-        self.wfile.write(body)
+        if model_size not in VALID_MODELS:
+            return jsonify(
+                {"error": f"Invalid model. Valid options: {sorted(VALID_MODELS)}"}
+            ), 400
 
-    def _add_cors_headers(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio_path = download_audio(url, tmp_dir)
+            result = transcribe_audio(audio_path, model_size, use_timestamps)
 
-    def log_message(self, format, *args):  # noqa: A002
-        """Suppress default HTTP request logging."""
-        pass
+        logger.info(
+            "rid=%s completed status=200 total_s=%.2f language=%s",
+            request_id, time.perf_counter() - request_start, result.get("language"),
+        )
+        return jsonify(result), 200
+
+    except Exception as e:
+        logger.exception(
+            "rid=%s failed model=%s url=%s total_s=%.2f",
+            request_id, model_size, url or "<missing>",
+            time.perf_counter() - request_start,
+        )
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
+
+@app.route("/api/health", methods=["GET"])
+def handle_health():
+    return jsonify({"status": "ok", "model": DEFAULT_MODEL}), 200
+
+
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=8000, debug=False)
