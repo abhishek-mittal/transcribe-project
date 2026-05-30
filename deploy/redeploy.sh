@@ -49,6 +49,18 @@ echo "==> restart services"
 systemctl daemon-reload
 systemctl restart transcribe-api sveltekit
 systemctl restart bgutil-pot || true
+
+# Ensure WARP proxy is connected (yt-dlp bot-bypass requires socks5://127.0.0.1:40000)
+if command -v warp-cli >/dev/null 2>&1; then
+  warp_status="$(warp-cli status 2>/dev/null || echo 'Unknown')"
+  if ! echo "$warp_status" | grep -q "Connected"; then
+    echo "==> WARP not connected — reconnecting..."
+    warp-cli connect 2>/dev/null || true
+    sleep 2
+  fi
+  echo "==> WARP: $(warp-cli status 2>/dev/null || echo 'unknown')"
+fi
+
 systemctl --no-pager --lines=0 status transcribe-api sveltekit
 
 echo "==> redeploy complete"
