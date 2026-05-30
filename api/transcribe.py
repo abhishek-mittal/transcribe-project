@@ -12,6 +12,7 @@ import time
 import traceback
 import uuid
 from datetime import timedelta
+from urllib.parse import urlparse
 
 import yt_dlp
 from faster_whisper import WhisperModel
@@ -99,9 +100,33 @@ def format_srt_timestamp(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
 
 
+# Hosts whose downloads need the YouTube-specific anti-bot tweaks (cookies,
+# player_client fallback chain, PO-token plugin). Anything else uses plain
+# yt-dlp defaults so we don't leak YouTube session cookies to unrelated hosts.
+_YOUTUBE_HOSTS = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+    "youtu.be",
+    "youtube-nocookie.com",
+    "www.youtube-nocookie.com",
+}
+
+
+def _is_youtube_url(url: str) -> bool:
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return host in _YOUTUBE_HOSTS
+
+
 def download_audio(url: str, output_dir: str) -> str:
     logger.info("download_audio start url=%s", url)
     download_start = time.perf_counter()
+
+    is_youtube = _is_youtube_url(url)
 
     # YouTube's n-challenge (URL deobfuscation) requires a JS runtime since
     # yt-dlp 2025. Node.js is installed on the VPS so this will always be
@@ -123,26 +148,33 @@ def download_audio(url: str, output_dir: str) -> str:
     if node_path:
         ydl_opts["js_runtimes"] = {"node": {"path": node_path}}
 
-    # Optional: cookies file for sites that gate downloads (e.g. YouTube bot
-    # challenge from datacenter IPs). Set YT_DLP_COOKIES_FILE to a Netscape-
-    # format cookies.txt exported from a logged-in browser.
-    cookies_file = os.environ.get("YT_DLP_COOKIES_FILE")
-    if cookies_file and os.path.exists(cookies_file):
-        ydl_opts["cookiefile"] = cookies_file
+    # The cookies, player-client fallback chain, and PO-token plugin are all
+    # YouTube-specific workarounds for its datacenter-IP bot challenge. Do not
+    # apply them to other hosts: a YouTube cookies.txt would leak Google
+    # session cookies to e.g. Vimeo / SoundCloud / podcast hosts on every
+    # request, and the extractor_args/player_client knobs are no-ops there.
+    if is_youtube:
+        cookies_file = os.environ.get("YT_DLP_COOKIES_FILE")
+        if cookies_file and os.path.exists(cookies_file):
+            ydl_opts["cookiefile"] = cookies_file
 
-    # YouTube extractor tuning. Trying multiple player clients lets yt-dlp
-    # fall back when one client is bot-challenged. The bgutil PO-token plugin
-    # (installed via pip on the VPS) auto-engages when present and provides a
-    # Proof-of-Origin token that bypasses many YouTube bot checks.
-    # YT_DLP_PLAYER_CLIENTS (comma-separated) overrides the default list.
-    player_clients = [
-        c.strip()
-        for c in os.environ.get("YT_DLP_PLAYER_CLIENTS", "default,tv,ios").split(",")
-        if c.strip()
-    ]
-    ydl_opts["extractor_args"] = {"youtube": {"player_client": player_clients}}
+        # Trying multiple player clients lets yt-dlp fall back when one client
+        # is bot-challenged. The bgutil PO-token plugin (installed via pip on
+        # the VPS) auto-engages when present and provides a Proof-of-Origin
+        # token that bypasses many YouTube bot checks.
+        # YT_DLP_PLAYER_CLIENTS (comma-separated) overrides the default list.
+        player_clients = [
+            c.strip()
+            for c in os.environ.get(
+                "YT_DLP_PLAYER_CLIENTS", "default,tv,ios"
+            ).split(",")
+            if c.strip()
+        ]
+        ydl_opts["extractor_args"] = {"youtube": {"player_client": player_clients}}
 
-    # Optional outbound proxy (residential / mobile) to dodge datacenter-IP gates.
+    # Optional outbound proxy (residential / mobile) to dodge datacenter-IP
+    # gates. Applies to all hosts because a flagged Vultr IP affects every
+    # extractor, not just YouTube.
     proxy = os.environ.get("YT_DLP_PROXY")
     if proxy:
         ydl_opts["proxy"] = proxy
