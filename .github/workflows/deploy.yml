@@ -11,6 +11,10 @@
 #                          base64 -w0 cookies.txt | pbcopy
 #                        Written to /etc/transcribe/cookies/youtube.txt on the VPS
 #                        on every deploy. Leave unset to keep the existing file.
+#   IG_DLP_COOKIES_B64   Same format, for Instagram. Written to
+#                        /etc/transcribe/cookies/instagram.txt. Leave unset to
+#                        keep the existing file (Instagram downloads will then
+#                        fail with "login required" for most content).
 name: CI / Deploy
 
 on:
@@ -88,6 +92,32 @@ jobs:
                head -1 /etc/transcribe/cookies/youtube.txt | grep -q Netscape \
                  || { echo "cookies.txt is not Netscape format" >&2; exit 1; }; \
                echo "cookies installed: $(wc -l < /etc/transcribe/cookies/youtube.txt) lines"'
+
+      - name: Sync Instagram cookies (optional)
+        env:
+          VULTR_HOST: ${{ secrets.VULTR_HOST }}
+          VULTR_SSH_USER: ${{ secrets.VULTR_SSH_USER || 'root' }}
+          IG_DLP_COOKIES_B64: ${{ secrets.IG_DLP_COOKIES_B64 }}
+        run: |
+          if [ -z "${IG_DLP_COOKIES_B64}" ]; then
+            echo "IG_DLP_COOKIES_B64 not set; leaving existing cookies file untouched."
+            exit 0
+          fi
+          printf '%s' "${IG_DLP_COOKIES_B64}" | ssh -i ~/.ssh/id_deploy \
+              -o UserKnownHostsFile=~/.ssh/known_hosts \
+              -o StrictHostKeyChecking=yes \
+              "${VULTR_SSH_USER}@${VULTR_HOST}" \
+              'set -euo pipefail; \
+               install -d -o root -g www-data -m 750 /etc/transcribe/cookies; \
+               umask 027; \
+               tmp=$(mktemp /etc/transcribe/cookies/instagram.txt.XXXXXX); \
+               base64 -d > "$tmp"; \
+               chown root:www-data "$tmp"; \
+               chmod 640 "$tmp"; \
+               mv "$tmp" /etc/transcribe/cookies/instagram.txt; \
+               head -1 /etc/transcribe/cookies/instagram.txt | grep -q Netscape \
+                 || { echo "cookies.txt is not Netscape format" >&2; exit 1; }; \
+               echo "cookies installed: $(wc -l < /etc/transcribe/cookies/instagram.txt) lines"'
 
       - name: Redeploy on VPS
         env:

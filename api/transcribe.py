@@ -113,13 +113,28 @@ _YOUTUBE_HOSTS = {
     "www.youtube-nocookie.com",
 }
 
+# Instagram also rate-limits / requires login for most content from datacenter
+# IPs. It needs its OWN cookies jar -- never share with YouTube.
+_INSTAGRAM_HOSTS = {
+    "instagram.com",
+    "www.instagram.com",
+    "m.instagram.com",
+}
+
+
+def _host_of(url: str) -> str:
+    try:
+        return (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return ""
+
 
 def _is_youtube_url(url: str) -> bool:
-    try:
-        host = (urlparse(url).hostname or "").lower()
-    except ValueError:
-        return False
-    return host in _YOUTUBE_HOSTS
+    return _host_of(url) in _YOUTUBE_HOSTS
+
+
+def _is_instagram_url(url: str) -> bool:
+    return _host_of(url) in _INSTAGRAM_HOSTS
 
 
 def download_audio(url: str, output_dir: str) -> str:
@@ -127,6 +142,7 @@ def download_audio(url: str, output_dir: str) -> str:
     download_start = time.perf_counter()
 
     is_youtube = _is_youtube_url(url)
+    is_instagram = _is_instagram_url(url)
 
     # YouTube's n-challenge (URL deobfuscation) requires a JS runtime since
     # yt-dlp 2025. Node.js is installed on the VPS so this will always be
@@ -171,6 +187,15 @@ def download_audio(url: str, output_dir: str) -> str:
             if c.strip()
         ]
         ydl_opts["extractor_args"] = {"youtube": {"player_client": player_clients}}
+
+    # Instagram requires login for most posts/reels from datacenter IPs.
+    # Uses its own cookies jar (do NOT reuse the YouTube one -- they're
+    # unrelated session cookies and pointing yt-dlp at the wrong jar can
+    # corrupt or leak credentials across hosts).
+    if is_instagram:
+        ig_cookies_file = os.environ.get("IG_DLP_COOKIES_FILE")
+        if ig_cookies_file and os.path.exists(ig_cookies_file):
+            ydl_opts["cookiefile"] = ig_cookies_file
 
     # Optional outbound proxy (residential / mobile) to dodge datacenter-IP
     # gates. Applies to all hosts because a flagged Vultr IP affects every
