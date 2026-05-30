@@ -137,6 +137,25 @@ def _is_instagram_url(url: str) -> bool:
     return _host_of(url) in _INSTAGRAM_HOSTS
 
 
+def _is_valid_netscape_cookies(path: str) -> bool:
+    """Return True only if *path* exists and starts with the Netscape cookie header.
+
+    yt-dlp raises an error if it is handed a cookies file that lacks this
+    header (empty placeholder files, wrong format, etc.).  Checking here lets
+    us silently skip bad files instead of letting the error surface to users.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                return "Netscape HTTP Cookie File" in line
+    except OSError:
+        pass
+    return False
+
+
 def download_audio(url: str, output_dir: str) -> str:
     logger.info("download_audio start url=%s", url)
     download_start = time.perf_counter()
@@ -171,7 +190,7 @@ def download_audio(url: str, output_dir: str) -> str:
     # request, and the extractor_args/player_client knobs are no-ops there.
     if is_youtube:
         cookies_file = os.environ.get("YT_DLP_COOKIES_FILE")
-        if cookies_file and os.path.exists(cookies_file):
+        if cookies_file and _is_valid_netscape_cookies(cookies_file):
             ydl_opts["cookiefile"] = cookies_file
 
         # Trying multiple player clients lets yt-dlp fall back when one client
@@ -182,11 +201,23 @@ def download_audio(url: str, output_dir: str) -> str:
         player_clients = [
             c.strip()
             for c in os.environ.get(
-                "YT_DLP_PLAYER_CLIENTS", "default,tv,ios"
+                "YT_DLP_PLAYER_CLIENTS", "android,ios,tv"
             ).split(",")
             if c.strip()
         ]
-        ydl_opts["extractor_args"] = {"youtube": {"player_client": player_clients}}
+        ydl_opts["extractor_args"] = {
+            "youtube": {
+                "player_client": player_clients,
+                # Always fetch a PO-token (via bgutil) so the PLAYER POT is
+                # sent with the Innertube API request when using the web
+                # client. No-op for android/ios/tv (bgutil ignores them).
+                "fetch_pot": ["always"],
+                # Skip the webpage download for the web client so initial_pr
+                # is None, which forces a fresh Innertube API call with the
+                # PLAYER POT. No-op for non-web clients.
+                "player_skip": ["webpage"],
+            }
+        }
 
     # Instagram requires login for most posts/reels from datacenter IPs.
     # Uses its own cookies jar (do NOT reuse the YouTube one -- they're
@@ -194,7 +225,7 @@ def download_audio(url: str, output_dir: str) -> str:
     # corrupt or leak credentials across hosts).
     if is_instagram:
         ig_cookies_file = os.environ.get("IG_DLP_COOKIES_FILE")
-        if ig_cookies_file and os.path.exists(ig_cookies_file):
+        if ig_cookies_file and _is_valid_netscape_cookies(ig_cookies_file):
             ydl_opts["cookiefile"] = ig_cookies_file
 
     # Optional outbound proxy (residential / mobile) to dodge datacenter-IP
