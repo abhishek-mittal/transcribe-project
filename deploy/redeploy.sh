@@ -48,6 +48,7 @@ chown -R www-data:www-data "$APP_DIR"
 echo "==> restart services"
 systemctl daemon-reload
 systemctl restart transcribe-api sveltekit
+systemctl restart bgutil-pot || true
 systemctl --no-pager --lines=0 status transcribe-api sveltekit
 
 echo "==> redeploy complete"
