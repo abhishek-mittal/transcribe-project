@@ -123,24 +123,27 @@ def download_audio(url: str, output_dir: str) -> str:
     if node_path:
         ydl_opts["js_runtimes"] = {"node": {"path": node_path}}
 
-    # Optional: cookies file for sites that gate downloads (e.g. YouTube bot
-    # challenge from datacenter IPs). Set YT_DLP_COOKIES_FILE to a Netscape-
-    # format cookies.txt exported from a logged-in browser.
-    cookies_file = os.environ.get("YT_DLP_COOKIES_FILE")
-    if cookies_file and os.path.exists(cookies_file):
-        ydl_opts["cookiefile"] = cookies_file
+    is_youtube = "youtube.com" in url or "youtu.be" in url
 
-    # YouTube extractor tuning. Trying multiple player clients lets yt-dlp
-    # fall back when one client is bot-challenged. The bgutil PO-token plugin
-    # (installed via pip on the VPS) auto-engages when present and provides a
-    # Proof-of-Origin token that bypasses many YouTube bot checks.
-    # YT_DLP_PLAYER_CLIENTS (comma-separated) overrides the default list.
-    player_clients = [
-        c.strip()
-        for c in os.environ.get("YT_DLP_PLAYER_CLIENTS", "default,tv,ios").split(",")
-        if c.strip()
-    ]
-    ydl_opts["extractor_args"] = {"youtube": {"player_client": player_clients}}
+    if is_youtube:
+        # Optional: cookies file for sites that gate downloads (e.g. YouTube bot
+        # challenge from datacenter IPs). Set YT_DLP_COOKIES_FILE to a Netscape-
+        # format cookies.txt exported from a logged-in browser.
+        cookies_file = os.environ.get("YT_DLP_COOKIES_FILE")
+        if cookies_file and os.path.exists(cookies_file):
+            ydl_opts["cookiefile"] = cookies_file
+
+        # YouTube extractor tuning. Trying multiple player clients lets yt-dlp
+        # fall back when one client is bot-challenged. The bgutil PO-token plugin
+        # (installed via pip on the VPS) auto-engages when present and provides a
+        # Proof-of-Origin token that bypasses many YouTube bot checks.
+        # YT_DLP_PLAYER_CLIENTS (comma-separated) overrides the default list.
+        player_clients = [
+            c.strip()
+            for c in os.environ.get("YT_DLP_PLAYER_CLIENTS", "default,tv,ios").split(",")
+            if c.strip()
+        ]
+        ydl_opts["extractor_args"] = {"youtube": {"player_client": player_clients}}
 
     # Optional outbound proxy (residential / mobile) to dodge datacenter-IP gates.
     proxy = os.environ.get("YT_DLP_PROXY")
