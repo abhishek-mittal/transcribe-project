@@ -4,6 +4,7 @@ Runs under Gunicorn on the Vultr VPS (see deploy/transcribe-api.service).
 Local dev: `python scripts/dev_api.py` (Vite proxies /api/* to it).
 """
 
+import json
 import logging
 import os
 import shutil
@@ -16,7 +17,7 @@ from urllib.parse import urlparse
 
 import yt_dlp
 from faster_whisper import WhisperModel
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request, stream_with_context
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +357,82 @@ def handle_transcribe():
             time.perf_counter() - request_start,
         )
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
+
+@app.route("/api/transcribe/stream", methods=["POST", "OPTIONS"])
+def handle_transcribe_stream():
+    """SSE streaming endpoint — yields transcription segments as they're produced."""
+    if request.method == "OPTIONS":
+        return "", 204
+
+    request_id = uuid.uuid4().hex[:8]
+    data = request.get_json(force=True, silent=True) or {}
+    url_value = (data.get("url") or "").strip()
+    model_size = data.get("model", DEFAULT_MODEL)
+    use_timestamps = bool(data.get("timestamps", True))
+
+    if not url_value:
+        return jsonify({"error": "url is required"}), 400
+    if model_size not in VALID_MODELS:
+        return jsonify(
+            {"error": f"Invalid model. Valid options: {sorted(VALID_MODELS)}"}
+        ), 400
+
+    def generate():
+        def sse(event: str, payload: dict) -> str:
+            return f"event: {event}\ndata: {json.dumps(payload)}\n\n"
+
+        logger.info(
+            "stream rid=%s model=%s url=%s", request_id, model_size, url_value
+        )
+        try:
+            yield sse("status", {"phase": "downloading"})
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                audio_path = download_audio(url_value, tmp_dir)
+                yield sse("status", {"phase": "transcribing"})
+
+                model = _get_model(model_size)
+                segments, info = model.transcribe(
+                    audio_path,
+                    beam_size=1,
+                    word_timestamps=False,
+                    vad_filter=True,
+                    language=None,
+                )
+
+                seg_index = 0
+                for segment in segments:
+                    text = segment.text.strip()
+                    if not text:
+                        continue
+                    seg_index += 1
+                    payload: dict = {
+                        "index": seg_index,
+                        "text": text,
+                        "start": round(segment.start, 2),
+                        "end": round(segment.end, 2),
+                    }
+                    if use_timestamps:
+                        payload["ts"] = format_timestamp(segment.start)
+                    yield sse("segment", payload)
+
+                logger.info(
+                    "stream rid=%s done language=%s segments=%d",
+                    request_id, info.language, seg_index,
+                )
+                yield sse("done", {"language": info.language})
+        except Exception as e:
+            logger.exception("stream rid=%s failed", request_id)
+            yield sse("error", {"error": str(e)})
+
+    return Response(
+        stream_with_context(generate()),
+        content_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.route("/api/health", methods=["GET"])

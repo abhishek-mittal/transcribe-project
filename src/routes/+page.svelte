@@ -1,4 +1,7 @@
 <script>
+  import { fly } from 'svelte/transition';
+  import { cubicOut } from 'svelte/easing';
+
   let url = '';
   // Fixed to 'base' — it's bundled with the function so cold starts skip
   // the HF download. See api/transcribe.py for the rationale.
@@ -15,6 +18,11 @@
   let darkMode = false;
   /** @type {number | null} */
   let openFaq = null;
+
+  /** @type {Array<{index: number, text: string, start: number, end: number, ts?: string}>} */
+  let streamingSegments = [];
+  /** @type {'idle' | 'downloading' | 'transcribing' | 'done'} */
+  let phase = 'idle';
 
   const steps = [
     {
@@ -50,53 +58,110 @@
     loading = true;
     error = null;
     result = null;
+    streamingSegments = [];
+    phase = 'idle';
 
     try {
-      const response = await fetch('/api/transcribe', {
+      const response = await fetch('/api/transcribe/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: trimmed, model, timestamps }),
       });
 
-      const contentType = response.headers.get('content-type') ?? '';
-      const isJson = contentType.includes('application/json');
-      const raw = await response.text();
-
-      /** @type {any} */
-      let data = null;
-      if (isJson && raw) {
+      if (!response.ok || !response.body) {
+        const raw = await response.text();
+        let msg = `Transcription failed (HTTP ${response.status})`;
         try {
-          data = JSON.parse(raw);
-        } catch {
-          data = null;
+          const d = JSON.parse(raw);
+          if (d?.error) msg = d.error;
+        } catch { /* ignore */ }
+        if (response.status === 404) {
+          msg = 'API endpoint not found (404). For local dev run `npm run dev:all`.';
+        } else if (response.status === 504 || response.status === 408) {
+          msg = 'The transcription timed out. Try a shorter video.';
         }
+        error = msg;
+        return;
       }
 
-      if (!response.ok) {
-        if (data?.error) {
-          error = data.error;
-        } else if (response.status === 404) {
-          error =
-            'API endpoint not found (404). For local dev run `npm run dev:all` (Vite + Python API). In production, check that the transcribe-api systemd service is running on the VPS.';
-        } else if (response.status === 504 || response.status === 408) {
-          error = 'The transcription timed out. Try a shorter video.';
-        } else if (response.status === 413) {
-          error = 'The audio file is too large.';
-        } else {
-          const snippet = raw ? ` — ${raw.slice(0, 140).replace(/\s+/g, ' ').trim()}` : '';
-          error = `Transcription failed (HTTP ${response.status})${snippet}`;
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        // SSE blocks are separated by double newlines
+        const events = buffer.split('\n\n');
+        buffer = events.pop() ?? '';
+
+        for (const block of events) {
+          if (!block.trim()) continue;
+          let eventType = 'message';
+          let dataStr = '';
+          for (const line of block.split('\n')) {
+            if (line.startsWith('event: ')) eventType = line.slice(7).trim();
+            else if (line.startsWith('data: ')) dataStr = line.slice(6);
+          }
+          if (!dataStr) continue;
+
+          /** @type {any} */
+          let payload;
+          try { payload = JSON.parse(dataStr); } catch { continue; }
+
+          if (eventType === 'status') {
+            phase = payload.phase;
+          } else if (eventType === 'segment') {
+            streamingSegments = [...streamingSegments, payload];
+          } else if (eventType === 'done') {
+            phase = 'done';
+            result = assembleResult(streamingSegments, payload.language);
+            activeTab = timestamps && result.timestamped ? 'timestamped' : 'plain';
+          } else if (eventType === 'error') {
+            error = payload.error ?? 'Transcription failed.';
+          }
         }
-      } else if (!data) {
-        error = 'Unexpected response from the server (not JSON). Please try again.';
-      } else {
-        result = data;
-        activeTab = timestamps && data.timestamped ? 'timestamped' : 'plain';
       }
     } catch (/** @type {any} */ e) {
       error = e?.message ?? 'Network error. Is the backend running?';
     } finally {
       loading = false;
     }
+  }
+
+  /**
+   * @param {Array<{index: number, text: string, start: number, end: number, ts?: string}>} segments
+   * @param {string} language
+   */
+  function assembleResult(segments, language) {
+    const plain = segments.map(s => s.text).join('\n');
+    const timestamped = timestamps
+      ? segments.map(s => `[${s.ts ?? fmtTimestamp(s.start)}] ${s.text}`).join('\n')
+      : null;
+    const srt = segments
+      .map((s, i) => `${i + 1}\n${fmtSrt(s.start)} --> ${fmtSrt(s.end)}\n${s.text}`)
+      .join('\n\n');
+    return { language, plain, timestamped, srt };
+  }
+
+  /** @param {number} seconds */
+  function fmtTimestamp(seconds) {
+    const m = Math.floor(seconds / 60);
+    const s = Math.floor(seconds % 60);
+    return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  }
+
+  /** @param {number} seconds */
+  function fmtSrt(seconds) {
+    const ms = Math.round(seconds * 1000);
+    const h = Math.floor(ms / 3_600_000);
+    const m = Math.floor((ms % 3_600_000) / 60_000);
+    const s = Math.floor((ms % 60_000) / 1000);
+    const r = ms % 1000;
+    const p = (/** @type {number} */ n, /** @type {number} */ w) => String(n).padStart(w, '0');
+    return `${p(h, 2)}:${p(m, 2)}:${p(s, 2)},${p(r, 3)}`;
   }
 
   /** @param {string} text */
@@ -225,7 +290,15 @@
         {#if loading}
           <div class="status-bar">
             <span class="status-dot pulse"></span>
-            <span>Downloading audio and transcribing — this may take a few minutes for longer videos…</span>
+            <span>
+              {#if phase === 'downloading'}
+                Downloading audio…
+              {:else if phase === 'transcribing'}
+                Transcribing{streamingSegments.length > 0 ? ` — ${streamingSegments.length} segment${streamingSegments.length === 1 ? '' : 's'} so far…` : '…'}
+              {:else}
+                Preparing — this may take a moment…
+              {/if}
+            </span>
           </div>
         {/if}
       </div>
@@ -241,32 +314,56 @@
         </div>
       {/if}
 
-      <!-- Result -->
-      {#if result}
+      <!-- Result (streaming) -->
+      {#if streamingSegments.length > 0 || phase === 'done'}
         <div class="glass card result-card">
           <div class="result-header">
             <div class="tabs">
-              <button class="tab" class:active={activeTab === 'plain'} on:click={() => (activeTab = 'plain')}>Plain</button>
-              {#if result.timestamped}
-                <button class="tab" class:active={activeTab === 'timestamped'} on:click={() => (activeTab = 'timestamped')}>Timestamped</button>
+              {#if phase === 'done'}
+                <button class="tab" class:active={activeTab === 'plain'} on:click={() => (activeTab = 'plain')}>Plain</button>
+                {#if result?.timestamped}
+                  <button class="tab" class:active={activeTab === 'timestamped'} on:click={() => (activeTab = 'timestamped')}>Timestamped</button>
+                {/if}
+                <button class="tab" class:active={activeTab === 'srt'} on:click={() => (activeTab = 'srt')}>SRT</button>
+              {:else}
+                <span class="live-badge">
+                  <span class="live-dot pulse"></span>
+                  Live
+                </span>
               {/if}
-              <button class="tab" class:active={activeTab === 'srt'} on:click={() => (activeTab = 'srt')}>SRT</button>
             </div>
             <div class="result-actions">
-              <span class="lang-badge">{result.language.toUpperCase()}</span>
-              <button class="btn-ghost" on:click={() => copyToClipboard(getActiveContent())}>
-                {#if copied}
-                  <svg width="13" height="13" viewBox="0 0 14 14" fill="none"><path d="M2.5 7L5.5 10L11.5 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                  Copied
-                {:else}
-                  <svg width="13" height="13" viewBox="0 0 14 14" fill="none"><rect x="4.5" y="1.5" width="8" height="8" rx="1.5" stroke="currentColor" stroke-width="1.4"/><path d="M1.5 5.5H3M1.5 5.5V12.5H8.5V11" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
-                  Copy
-                {/if}
-              </button>
+              {#if phase === 'done' && result}
+                <span class="lang-badge">{result.language.toUpperCase()}</span>
+                <button class="btn-ghost" on:click={() => copyToClipboard(getActiveContent())}>
+                  {#if copied}
+                    <svg width="13" height="13" viewBox="0 0 14 14" fill="none"><path d="M2.5 7L5.5 10L11.5 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    Copied
+                  {:else}
+                    <svg width="13" height="13" viewBox="0 0 14 14" fill="none"><rect x="4.5" y="1.5" width="8" height="8" rx="1.5" stroke="currentColor" stroke-width="1.4"/><path d="M1.5 5.5H3M1.5 5.5V12.5H8.5V11" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+                    Copy
+                  {/if}
+                </button>
+              {/if}
             </div>
           </div>
           <div class="result-body">
-            <pre class="transcript">{getActiveContent()}</pre>
+            {#if phase === 'done' && result && activeTab !== 'plain'}
+              <pre class="transcript">{getActiveContent()}</pre>
+            {:else if streamingSegments.length === 0}
+              <p class="no-speech">No speech detected in this audio.</p>
+            {:else}
+              <div class="stream-transcript">
+                {#each streamingSegments as seg (seg.index)}
+                  <p class="stream-segment" in:fly={{ y: 10, duration: 320, easing: cubicOut }}>
+                    {#if timestamps && seg.ts}<span class="seg-ts">[{seg.ts}]</span> {/if}{seg.text}
+                  </p>
+                {/each}
+                {#if loading && phase === 'transcribing'}
+                  <span class="cursor-blink" aria-hidden="true"></span>
+                {/if}
+              </div>
+            {/if}
           </div>
         </div>
       {/if}
@@ -972,5 +1069,69 @@
   .footer-copy {
     font-size: 12px;
     color: var(--text-3);
+  }
+
+  /* ─── Streaming transcript ────────────────────────── */
+  .stream-transcript {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .stream-segment {
+    font-family: 'Fraunces', 'Iowan Old Style', Georgia, serif;
+    font-size: 16px;
+    line-height: 1.8;
+    color: var(--text);
+    letter-spacing: -0.1px;
+    margin: 0;
+  }
+
+  .seg-ts {
+    font-family: 'Inter', system-ui, sans-serif;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--highlight);
+    margin-right: 2px;
+  }
+
+  .live-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--highlight);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  .live-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--highlight);
+    flex-shrink: 0;
+  }
+
+  .cursor-blink {
+    display: inline-block;
+    width: 2px;
+    height: 1.1em;
+    background: var(--highlight);
+    border-radius: 1px;
+    vertical-align: text-bottom;
+    animation: blink 1s step-end infinite;
+  }
+
+  @keyframes blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0; }
+  }
+
+  .no-speech {
+    font-size: 14px;
+    color: var(--text-3);
+    font-style: italic;
   }
 </style>
