@@ -19,10 +19,19 @@
   /** @type {number | null} */
   let openFaq = null;
 
-  /** @type {Array<{index: number, text: string, start: number, end: number, ts?: string}>} */
-  let streamingSegments = [];
   /** @type {'idle' | 'downloading' | 'transcribing' | 'done'} */
   let phase = 'idle';
+  /**
+   * Segments with typewriter state. `displayed` grows char-by-char until it equals `text`.
+   * @type {Array<{index: number, text: string, start: number, end: number, ts?: string, displayed: string}>}
+   */
+  let streamSegments = [];
+  let isTyping = false;
+  /** Index in streamSegments currently being typed, -1 when idle */
+  let typingIdx = -1;
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  let typewriterTimer = null;
+  const CHAR_DELAY = 16; // ms per character (~60 fps)
 
   const steps = [
     {
@@ -58,7 +67,11 @@
     loading = true;
     error = null;
     result = null;
-    streamingSegments = [];
+    streamSegments = [];
+    isTyping = false;
+    typingIdx = -1;
+    if (typewriterTimer) clearTimeout(typewriterTimer);
+    typewriterTimer = null;
     phase = 'idle';
 
     try {
@@ -70,15 +83,9 @@
 
       if (!response.ok || !response.body) {
         const raw = await response.text();
-        let msg = `Transcription failed (HTTP ${response.status})`;
-        try {
-          const d = JSON.parse(raw);
-          if (d?.error) msg = d.error;
-        } catch { /* ignore */ }
-        if (response.status === 404) {
-          msg = 'API endpoint not found (404). For local dev run `npm run dev:all`.';
-        } else if (response.status === 504 || response.status === 408) {
-          msg = 'The transcription timed out. Try a shorter video.';
+        let msg = 'Something went wrong. Please try again.';
+        if (response.status === 504 || response.status === 408) {
+          msg = 'This took too long to process. Try a shorter clip.';
         }
         error = msg;
         return;
@@ -114,18 +121,24 @@
           if (eventType === 'status') {
             phase = payload.phase;
           } else if (eventType === 'segment') {
-            streamingSegments = [...streamingSegments, payload];
+            enqueueSegment(payload);
           } else if (eventType === 'done') {
+            if (typewriterTimer) clearTimeout(typewriterTimer);
+            typewriterTimer = null;
+            isTyping = false;
+            typingIdx = -1;
+            // Reveal all remaining text instantly before assembling result
+            streamSegments = streamSegments.map(s => ({ ...s, displayed: s.text }));
             phase = 'done';
-            result = assembleResult(streamingSegments, payload.language);
+            result = assembleResult(streamSegments, payload.language);
             activeTab = timestamps && result.timestamped ? 'timestamped' : 'plain';
           } else if (eventType === 'error') {
-            error = payload.error ?? 'Transcription failed.';
+            error = 'Something went wrong. Please try again.';
           }
         }
       }
     } catch (/** @type {any} */ e) {
-      error = e?.message ?? 'Network error. Is the backend running?';
+      error = 'Connection error. Please check your internet and try again.';
     } finally {
       loading = false;
     }
@@ -187,6 +200,38 @@
   /** @param {number} i */
   function toggleFaq(i) {
     openFaq = openFaq === i ? null : i;
+  }
+
+  /** @param {{index: number, text: string, start: number, end: number, ts?: string}} seg */
+  function enqueueSegment(seg) {
+    streamSegments = [...streamSegments, { ...seg, displayed: '' }];
+    if (!isTyping) startTypingAt(streamSegments.length - 1);
+  }
+
+  /** @param {number} idx */
+  function startTypingAt(idx) {
+    typingIdx = idx;
+    isTyping = true;
+    typeNextChar();
+  }
+
+  function typeNextChar() {
+    if (!isTyping || typingIdx < 0 || typingIdx >= streamSegments.length) return;
+    const seg = streamSegments[typingIdx];
+    if (seg.displayed.length >= seg.text.length) {
+      // Segment fully typed — advance to next queued segment
+      const next = typingIdx + 1;
+      if (next < streamSegments.length) {
+        startTypingAt(next);
+      } else {
+        isTyping = false;
+        typingIdx = -1;
+      }
+      return;
+    }
+    streamSegments[typingIdx] = { ...seg, displayed: seg.text.slice(0, seg.displayed.length + 1) };
+    streamSegments = streamSegments; // trigger Svelte reactivity
+    typewriterTimer = setTimeout(typeNextChar, CHAR_DELAY);
   }
 </script>
 
@@ -292,11 +337,15 @@
             <span class="status-dot pulse"></span>
             <span>
               {#if phase === 'downloading'}
-                Downloading audio…
+                Fetching your audio…
               {:else if phase === 'transcribing'}
-                Transcribing{streamingSegments.length > 0 ? ` — ${streamingSegments.length} segment${streamingSegments.length === 1 ? '' : 's'} so far…` : '…'}
+                {#if streamSegments.length > 0}
+                  Turning speech into text · {streamSegments.length} segment{streamSegments.length === 1 ? '' : 's'}
+                {:else}
+                  Turning speech into text…
+                {/if}
               {:else}
-                Preparing — this may take a moment…
+                Getting things ready…
               {/if}
             </span>
           </div>
@@ -315,7 +364,7 @@
       {/if}
 
       <!-- Result (streaming) -->
-      {#if streamingSegments.length > 0 || phase === 'done'}
+      {#if streamSegments.length > 0 || phase === 'done'}
         <div class="glass card result-card">
           <div class="result-header">
             <div class="tabs">
@@ -350,16 +399,18 @@
           <div class="result-body">
             {#if phase === 'done' && result && activeTab !== 'plain'}
               <pre class="transcript">{getActiveContent()}</pre>
-            {:else if streamingSegments.length === 0}
-              <p class="no-speech">No speech detected in this audio.</p>
+            {:else if streamSegments.length === 0}
+              {#if phase === 'done'}
+                <p class="no-speech">No speech detected in this audio.</p>
+              {/if}
             {:else}
               <div class="stream-transcript">
-                {#each streamingSegments as seg (seg.index)}
-                  <p class="stream-segment" in:fly={{ y: 10, duration: 320, easing: cubicOut }}>
-                    {#if timestamps && seg.ts}<span class="seg-ts">[{seg.ts}]</span> {/if}{seg.text}
+                {#each streamSegments as seg (seg.index)}
+                  <p class="stream-segment">
+                    {#if phase !== 'done' && timestamps && seg.ts}<span class="seg-ts">[{seg.ts}]</span> {/if}{seg.displayed}{#if seg.displayed.length < seg.text.length}<span class="cursor-blink" aria-hidden="true"></span>{/if}
                   </p>
                 {/each}
-                {#if loading && phase === 'transcribing'}
+                {#if !isTyping && loading && phase === 'transcribing'}
                   <span class="cursor-blink" aria-hidden="true"></span>
                 {/if}
               </div>
