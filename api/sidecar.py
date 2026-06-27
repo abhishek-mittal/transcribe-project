@@ -392,7 +392,11 @@ def probe_url(url: str) -> dict[str, Any]:
             }
         # Cap the search depth so a runaway query can't stall the probe.
         n = max(1, min(SEARCH_RESULTS_LIMIT, 100))
-        synthetic_url = f"ytsearch[{n}]:{query}"
+        # yt-dlp's URL parser rejects `ytsearch[N]:` (brackets) and the bare
+        # `ytsearch:` form is uncapped. The supported form for a bounded
+        # count is `ytsearch<N>:<query>` — no brackets, count glued to the
+        # prefix. `ytsearchall:` is also supported but unconstrained.
+        synthetic_url = f"ytsearch{n}:{query}"
         ydl_opts = {
             "quiet": True,
             "no_warnings": True,
