@@ -11,6 +11,11 @@ const API_PORT = process.env.DEV_API_PORT || '8787';
 export default defineConfig({
   plugins: [sveltekit()],
   server: {
+    // Bind to all interfaces so Chrome DevTools (which prefers IPv4 localhost)
+    // can connect when the Tauri webview is loading from this dev server.
+    host: '127.0.0.1',
+    port: 5173,
+    strictPort: true,
     proxy: {
       '/api': {
         target: `http://127.0.0.1:${API_PORT}`,
