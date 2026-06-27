@@ -10,7 +10,6 @@
   import UrlInputPanel from '$lib/desktop/UrlInputPanel.svelte';
   import TranscriptPanel from '$lib/desktop/TranscriptPanel.svelte';
   import SettingsView from '$lib/desktop/SettingsView.svelte';
-  import VideoPicker from '$lib/desktop/VideoPicker.svelte';
   import QueueView from '$lib/desktop/QueueView.svelte';
   import JobHistoryView from '$lib/desktop/JobHistoryView.svelte';
 
@@ -1303,7 +1302,7 @@
           />
         </div>
         {#if activeView === 'transcribe' || activeView === 'picker'}
-          <aside class="left-pane">
+          <aside class="left-pane left-pane-full">
             <UrlInputPanel
               bind:url
               bind:timestamps
@@ -1330,26 +1329,6 @@
               on:forceTranscribe={forceTranscribe}
             />
           </aside>
-          <section class="right-pane">
-            {#if activeView === 'picker' && playlistProbeResult}
-              <VideoPicker
-                entries={playlistProbeResult.entries || []}
-                playlistTitle={playlistProbeResult.title || ''}
-                uploader={playlistProbeResult.uploader || ''}
-                on:selectionChange={(e) => (pickerSelectedCount = e.detail.count)}
-                on:startJob={handleStartJob}
-              />
-            {:else}
-              <div class="transcribe-empty-panel">
-                <div class="empty-icon">
-                  <svg width="32" height="32" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                    <path d="M5 9V13M8 7V15M11 5V17M14 8V14M17 10V12" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
-                  </svg>
-                </div>
-                <p class="empty-title">Paste a URL and click Transcribe.</p>
-              </div>
-            {/if}
-          </section>
         {:else if activeView === 'history'}
           <!-- History: full-width list by default; right-pane transcript slides in when an item is opened. -->
           <div class="full-pane" class:with-detail={!!selectedHistoryRecord}>
@@ -2045,39 +2024,9 @@
     overflow: hidden;
     min-height: 0;
   }
-  .right-pane {
+  .left-pane-full {
     flex: 1;
-    min-width: 0;
-    display: flex;
-    min-height: 0;
-  }
-  .transcribe-empty-panel {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    background: var(--surface-1);
-    border-radius: 12px;
-    border: 1px solid var(--glass-border-soft);
-    padding: 40px 32px;
-    text-align: center;
-  }
-  .transcribe-empty-panel .empty-icon {
-    width: 52px;
-    height: 52px;
-    border-radius: 12px;
-    background: var(--surface-2);
-    display: grid;
-    place-items: center;
-    margin-bottom: 14px;
-    color: var(--text-2);
-  }
-  .transcribe-empty-panel .empty-title {
-    font-size: 14px;
-    font-weight: 600;
-    color: var(--text-2);
-    margin: 0;
+    width: auto;
   }
 
   /* ─── Hero ────────────────────────────────────────── */
