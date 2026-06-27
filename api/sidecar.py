@@ -341,8 +341,17 @@ def run_transcription(url: str, model_size: str, use_timestamps: bool) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 # Default cap on search-results entries. Matches YouTube's own ~20-per-page
-# granularity and keeps the probe under a couple of seconds.
-SEARCH_RESULTS_LIMIT = 50
+# granularity and keeps the probe under a couple of seconds even on slow
+# residential networks. Larger counts are rejected — see MAX below.
+SEARCH_RESULTS_LIMIT = 20
+# Hard ceiling regardless of what callers request. Stops a malformed /
+# pathological query from stalling the probe for tens of seconds.
+SEARCH_RESULTS_MAX = 30
+# Per-socket timeout for yt-dlp HTTP calls during probe. Generous enough
+# to survive a slow residential link without timing out on a single
+# thumbnail fetch, but tight enough that a stuck connection doesn't
+# multiply across 20 entries.
+SEARCH_SOCKET_TIMEOUT = 15
 
 
 def _normalise_entries(raw_entries: list[Any]) -> list[dict[str, Any]]:
@@ -391,7 +400,9 @@ def probe_url(url: str) -> dict[str, Any]:
                 "message": "search_query is empty",
             }
         # Cap the search depth so a runaway query can't stall the probe.
-        n = max(1, min(SEARCH_RESULTS_LIMIT, 100))
+        # SEARCH_RESULTS_LIMIT (20) matches YouTube's per-page count; the
+        # hard cap SEARCH_RESULTS_MAX (30) is a safety net.
+        n = max(1, min(SEARCH_RESULTS_LIMIT, SEARCH_RESULTS_MAX))
         # yt-dlp's URL parser rejects `ytsearch[N]:` (brackets) and the bare
         # `ytsearch:` form is uncapped. The supported form for a bounded
         # count is `ytsearch<N>:<query>` — no brackets, count glued to the
@@ -402,7 +413,7 @@ def probe_url(url: str) -> dict[str, Any]:
             "no_warnings": True,
             "skip_download": True,
             "extract_flat": "in_playlist",
-            "socket_timeout": 8,
+            "socket_timeout": SEARCH_SOCKET_TIMEOUT,
         }
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -420,7 +431,9 @@ def probe_url(url: str) -> dict[str, Any]:
 
         # ytsearch[N]: returns a playlist-shaped result; reuse the same
         # entry normalisation so the frontend can render playlist and
-        # search results with the same VideoPicker component.
+        # search results with the same VideoPicker component. Note that
+        # thumbnails come back empty under extract_flat=in_playlist — the
+        # picker renders a placeholder when this happens.
         raw_entries = info.get("entries") or []
         entries = _normalise_entries(raw_entries)
         return {

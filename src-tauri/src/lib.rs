@@ -430,7 +430,12 @@ async fn probe_via_sidecar(app: &AppHandle, url: &str) -> serde_json::Value {
         Err(e) => return serde_json::json!({"type": "error", "code": "INTERNAL", "message": format!("spawn failed: {e}")}),
     };
     eprintln!("probe_via_sidecar: pid={}", child.pid());
-    let result = tokio::time::timeout(Duration::from_secs(45), async move {
+    // Sidecar probe timeout: covers PyInstaller cold-start (~3-5s on first
+    // run, ~1s after) plus yt-dlp's network round-trips. YouTube search
+    // results with N=20 entries typically take 2-4s on residential links;
+    // we leave generous headroom for slow connections without hanging the
+    // UI forever.
+    let result = tokio::time::timeout(Duration::from_secs(60), async move {
         while let Some(event) = rx.recv().await {
             match event {
                 CommandEvent::Stdout(bytes) => {
