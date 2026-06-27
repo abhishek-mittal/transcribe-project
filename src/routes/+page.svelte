@@ -1323,6 +1323,7 @@
               on:transcribe={handleTranscribeViaQueue}
               on:cancel={cancelTranscription}
               on:playlist={handlePlaylistDetected}
+              on:startJob={handleStartJob}
               on:goSettings={() => (activeView = 'settings')}
               on:transcribePicker={handleTranscribePicker}
               on:viewDuplicate={viewDuplicate}
