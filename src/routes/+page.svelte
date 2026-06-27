@@ -469,11 +469,15 @@
     } else if (event === 'result') {
       const wordCount = getWordCount(payload.plain || '');
       const transcriptResult = { language: payload.language, plain: payload.plain, timestamped: payload.timestamped, srt: payload.srt };
+      // Compute actual audio duration from the last streamed segment's end time;
+      // probe-reported duration is often 0 for yt-dlp URLs that skip headers.
+      const audioDuration = (item.streamSegments || []).reduce((max, seg) => Math.max(max, seg.end || 0), 0);
       currentJob.items[itemIndex] = {
         ...item,
         status: 'done',
         result: transcriptResult,
         wordCount,
+        audioDuration,
         completedAt: new Date().toISOString(),
       };
       currentJob = { ...currentJob };
@@ -532,7 +536,7 @@
     const failureCount = currentJob.items.filter((i) => i.status === 'failed').length;
     const cancelledCount = currentJob.items.filter((i) => i.status === 'cancelled').length;
     const totalWords = currentJob.items.reduce((s, i) => s + (i.wordCount || 0), 0);
-    const totalAudioSecs = currentJob.items.filter((i) => i.status === 'done').reduce((s, i) => s + (i.duration || 0), 0);
+    const totalAudioSecs = currentJob.items.filter((i) => i.status === 'done').reduce((s, i) => s + (i.audioDuration || i.duration || 0), 0);
 
     const jobRecord = {
       id: currentJob.id,
@@ -838,6 +842,16 @@
     queueActive = true;
     activeView = 'queue';
     runQueueLoop();
+  }
+
+  /** Open a completed queue item's transcript in the History tab. */
+  function handleQueueViewHistory(item) {
+    activeView = 'history';
+    if (item?.result?.plain) {
+      selectedHistoryRecord = { id: item.id, url: item.url, title: item.title, language: item.result.language };
+      result = { language: item.result.language, plain: item.result.plain, timestamped: item.result.timestamped, srt: item.result.srt };
+      activeTab = 'plain';
+    }
   }
 
   /** @param {any} record */
@@ -1281,10 +1295,11 @@
             {timestamps}
             activityEntries={activityLog}
             {activityHandlers}
+            activeItemId={queueCurrentItemId}
             on:cancelJob={cancelQueueJob}
             on:retryItem={(e) => retryQueueItem(e.detail.id)}
             on:cancelItem={(e) => cancelQueueItem(e.detail.id)}
-            on:viewHistory={() => (activeView = 'history')}
+            on:viewHistory={(e) => handleQueueViewHistory(e.detail?.item)}
           />
         </div>
         {#if activeView === 'transcribe' || activeView === 'picker'}
@@ -1325,16 +1340,14 @@
                 on:startJob={handleStartJob}
               />
             {:else}
-              <TranscriptPanel
-                {result}
-                bind:activeTab
-                defaultName={url}
-                {streamSegments}
-                {phase}
-                {timestamps}
-                onTabChange={(t) => (activeTab = t)}
-                onCopy={() => copyToClipboard(getActiveContent())}
-              />
+              <div class="transcribe-empty-panel">
+                <div class="empty-icon">
+                  <svg width="32" height="32" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                    <path d="M5 9V13M8 7V15M11 5V17M14 8V14M17 10V12" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+                  </svg>
+                </div>
+                <p class="empty-title">Paste a URL and click Transcribe.</p>
+              </div>
             {/if}
           </section>
         {:else if activeView === 'history'}
@@ -2037,6 +2050,34 @@
     min-width: 0;
     display: flex;
     min-height: 0;
+  }
+  .transcribe-empty-panel {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    background: var(--surface-1);
+    border-radius: 12px;
+    border: 1px solid var(--glass-border-soft);
+    padding: 40px 32px;
+    text-align: center;
+  }
+  .transcribe-empty-panel .empty-icon {
+    width: 52px;
+    height: 52px;
+    border-radius: 12px;
+    background: var(--surface-2);
+    display: grid;
+    place-items: center;
+    margin-bottom: 14px;
+    color: var(--text-2);
+  }
+  .transcribe-empty-panel .empty-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-2);
+    margin: 0;
   }
 
   /* ─── Hero ────────────────────────────────────────── */
