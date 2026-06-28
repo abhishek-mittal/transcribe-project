@@ -2,6 +2,7 @@
   import { createEventDispatcher, onDestroy } from 'svelte';
   import UrlDropZone from './UrlDropZone.svelte';
   import VideoPicker from './VideoPicker.svelte';
+  import ProbeActivityStrip from './ProbeActivityStrip.svelte';
 
   export let url = '';
   export let loading = false;
@@ -15,10 +16,18 @@
   export let model = 'tiny';
   /** @type {any} invoke function from Tauri */
   export let invokeFn = null;
+  /** @type {any} listen function from Tauri (for probe-activity events) */
+  export let listenFn = null;
   /** When true (playlist detected), show "Transcribe X videos" button */
   export let pickerMode = false;
   /** Number of selected videos when pickerMode is true */
   export let selectedCount = 0;
+  /**
+   * URLs already present in transcription history — forwarded to
+   * VideoPicker so it can grey out already-transcribed rows.
+   * @type {Set<string>}
+   */
+  export let transcribedUrls = new Set();
 
   /**
    * Set by parent when the URL already has a completed transcript in history.
@@ -38,9 +47,34 @@
    * Set when the probe resolves to a list (playlist or search results).
    * Owned locally because the picker renders inside this panel; the parent
    * only needs to know `activeView === 'picker'` for layout decisions.
-   * @type {{ kind: 'playlist'|'search', title?: string, query?: string, entries?: any[], uploader?: string } | null}
+   * @type {{ kind: 'playlist'|'search', title?: string, query?: string, entries: any[], uploader?: string, total_count?: number | null } | null}
    */
   let listProbeResult = null;
+
+  /**
+   * The picker's currently selected entries, kept in sync via its
+   * `selectionChange` event. The footer "Transcribe N videos →" button
+   * uses this directly instead of relying on `transcribePicker`/`transcribe`
+   * (see F12 spec section C — the old footer button was a dead no-op).
+   * @type {Array<any>}
+   */
+  let selectedPickerEntries = [];
+
+  /** True while a "Load more" page fetch is in flight. */
+  let loadingMore = false;
+  /** Set when the last "Load more" fetch failed. */
+  let loadMoreError = false;
+
+  /** F14 probe activity — drives the ProbeActivityStrip under the URL input. */
+  /** @type {Array<{id: number, severity: 'info'|'success'|'warn'|'error', message: string}>} */
+  let probeActivity = [];
+  /** Age (in seconds) of the cache entry currently being shown. null = no cache hit. */
+  let cacheAge = null;
+  /** Active `probe-activity` event subscription. Cleaned up on URL change / unmount. */
+  let probeActivityUnlisten = null;
+  /** Per-probe state — used to translate emitted events into activity messages. */
+  let liveProbeSeenEntries = 0;
+  let liveProbeTotalCount = null;
 
   const dispatch = createEventDispatcher();
 
@@ -62,6 +96,14 @@
     probeState = 'idle';
     probeResult = null;
     probeError = null;
+    probeActivity = [];
+    cacheAge = null;
+    liveProbeSeenEntries = 0;
+    liveProbeTotalCount = null;
+    if (probeActivityUnlisten) {
+      try { probeActivityUnlisten(); } catch {}
+      probeActivityUnlisten = null;
+    }
   }
 
   function cancelDebounce() {
@@ -71,42 +113,213 @@
     }
   }
 
+  function pushActivity(severity, message) {
+    probeActivity = [{ id: ++pushActivityId, severity, message }, ...probeActivity].slice(0, 6);
+  }
+  let pushActivityId = 0;
+
   async function runProbe(probeUrl) {
     if (!invokeFn) return;
+    resetProbe();
+    liveProbeSeenEntries = 0;
+    liveProbeTotalCount = null;
     probeState = 'probing';
-    probeResult = null;
-    probeError = null;
+    pushActivity('info', 'Checking URL…');
+
+    // 1. Cache check first (F14) — instant picker render on cache hit.
+    let cacheChecked = false;
+    try {
+      const cached = await invokeFn('get_cached_probe', { url: probeUrl });
+      cacheChecked = true;
+      if (cached && cached.type !== 'error') {
+        // Get the actual age for display. We don't currently get the age
+        // back from get_cached_probe (it returns the value only), so we
+        // recompute via a quick second call. To keep this simple, we just
+        // show "cached" without an exact age on this path — the user
+        // can hit Refresh to force a fresh probe.
+        cacheAge = 0;
+        if (cached.type === 'video') {
+          probeState = 'preview';
+          probeResult = cached;
+          listProbeResult = null;
+          pushActivity('success', `Loaded from cache · ${cached.title || 'video'}`);
+        } else if (cached.type === 'playlist' || cached.type === 'search') {
+          probeState = 'idle';
+          probeResult = null;
+          listProbeResult = { ...cached, kind: cached.kind || cached.type };
+          pushActivity('success', `Loaded from cache · ${cached.entries?.length ?? 0} videos`);
+          dispatch('playlist', listProbeResult);
+        }
+        return;
+      }
+    } catch (e) {
+      // Cache miss is fine; fall through to live probe.
+      cacheChecked = false;
+    }
+
+    // 2. Subscribe to probe-activity events BEFORE invoking the probe, so
+    // we don't miss any early `status` heartbeats from the sidecar.
+    if (listenFn) {
+      try {
+        probeActivityUnlisten = await listenFn('probe-activity', (/** @type {any} */ event) => {
+          const payload = event.payload;
+          if (!payload || typeof payload !== 'object') return;
+          handleProbeActivityEvent(payload);
+        });
+      } catch (e) {
+        // Listener setup failure shouldn't block the probe itself — the
+        // picker will still get the final result.
+        console.warn('probe-activity listener setup failed:', e);
+      }
+    }
+
     try {
       const res = await invokeFn('probe_url', { url: probeUrl });
-      if (res.type === 'video') {
-        probeState = 'preview';
-        probeResult = res;
-        listProbeResult = null;
-      } else if (res.type === 'playlist' || res.type === 'search') {
-        probeState = 'idle';
-        probeResult = null;
-        // Search-results and playlists share the same flow; the picker
-        // labels the source via `kind`. Empty entries surface an inline
-        // error instead of opening a useless picker.
-        if (Array.isArray(res.entries) && res.entries.length === 0) {
-          listProbeResult = null;
-          probeState = 'error';
-          probeError = `No videos found for this ${res.type === 'search' ? 'search' : 'playlist'}.`;
-        } else {
-          listProbeResult = { ...res, kind: res.kind || res.type };
-        }
-        // Still notify parent so it can switch activeView to 'picker'.
-        dispatch('playlist', listProbeResult ?? { kind: res.type, query: res.query, title: res.title });
-      } else {
-        probeState = 'error';
-        probeError = res.code === 'UNSUPPORTED_PLATFORM'
-          ? 'This URL is not supported.'
-          : (res.message || 'Could not load URL.');
-      }
+      handleProbeResult(res, probeUrl);
     } catch (e) {
       probeState = 'error';
       probeError = 'Could not load URL.';
+      pushActivity('error', 'Probe failed');
+    } finally {
+      if (probeActivityUnlisten) {
+        try { probeActivityUnlisten(); } catch {}
+        probeActivityUnlisten = null;
+      }
     }
+  }
+
+  /**
+   * Apply one `probe-activity` event from the sidecar. Called both during
+   * the live probe (via the listenFn subscription) and indirectly via the
+   * final `probe_url` invoke resolving. Idempotent for entries the final
+   * result also contains — dedupe by `id`.
+   * @param {any} payload
+   */
+  function handleProbeActivityEvent(payload) {
+    const ev = payload.event;
+    if (ev === 'status') {
+      pushActivity('info', payload.message || 'working…');
+      return;
+    }
+    if (ev === 'entry') {
+      const entry = payload.entry;
+      if (!entry || !entry.id) return;
+      // Append to listProbeResult.entries if we're already in picker mode
+      // for this URL; otherwise buffer so handleProbeResult can populate it
+      // when the final result lands.
+      const existing = listProbeResult?.entries ?? [];
+      if (!existing.some((/** @type {any} */ e) => e.id === entry.id)) {
+        const next = { ...(listProbeResult ?? {}), entries: [...existing, entry] };
+        if (!listProbeResult) {
+          // First entry before final result — seed the picker shell so
+          // rows render live. `kind`/`title`/`total_count` are filled in
+          // when the final result arrives.
+          next.kind = 'playlist';
+        }
+        listProbeResult = next;
+        liveProbeSeenEntries = next.entries.length;
+        pushActivity('info', `Streaming entry ${liveProbeSeenEntries}`);
+      }
+      return;
+    }
+    if (ev === 'done') {
+      // The final `done` event carries totals — promote them. We don't
+      // push a generic "Probe ready" message here because the listener
+      // fires AFTER the probe_url invoke resolves in Rust's stream loop
+      // (the result blob is captured synchronously, the event emit is
+      // async), so handleProbeResult's "N videos · ready" already landed
+      // first. Pushing "Probe ready" here would overwrite it with a less
+      // informative message. The total_count update still runs so the
+      // picker's "20 of N videos" header is correct as soon as the
+      // totals arrive.
+      if (typeof payload.total_count === 'number') {
+        liveProbeTotalCount = payload.total_count;
+        listProbeResult = { ...(listProbeResult ?? {}), total_count: payload.total_count };
+      }
+      return;
+    }
+    if (ev === 'error') {
+      // Mid-probe error (rare — usually the final result carries the
+      // error). Surface it but don't replace any `done` that already won.
+      if (probeState === 'probing') {
+        pushActivity('error', payload.message || 'probe error');
+      }
+      return;
+    }
+  }
+
+  /**
+   * Handle the final probe_url invoke result (one-shot, after the
+   * streaming events have settled). Dedupes entries against what the
+   * listener already streamed — both code paths may include the same
+   * entries, and the picker uses id as the keyed-each identity.
+   * @param {any} res
+   * @param {string} probeUrl
+   */
+  function handleProbeResult(res, probeUrl) {
+    if (!res || typeof res !== 'object') {
+      probeState = 'error';
+      probeError = 'Could not load URL.';
+      pushActivity('error', 'Probe failed');
+      return;
+    }
+    if (res.type === 'video') {
+      probeState = 'preview';
+      probeResult = res;
+      listProbeResult = null;
+      pushActivity('success', res.title || 'video');
+    } else if (res.type === 'playlist' || res.type === 'search') {
+      probeState = 'idle';
+      probeResult = null;
+      // Merge: any entries already streamed via probe-activity events
+      // stay in place; the final result's entries dedupe by id.
+      const streamed = listProbeResult?.entries ?? [];
+      const finalEntries = Array.isArray(res.entries) ? res.entries : [];
+      const seen = new Set(streamed.map((/** @type {any} */ e) => e.id));
+      const merged = [
+        ...streamed,
+        ...finalEntries.filter((/** @type {any} */ e) => e.id && !seen.has(e.id)),
+      ];
+      listProbeResult = {
+        ...res,
+        kind: res.kind || res.type,
+        entries: merged,
+        total_count: res.total_count ?? listProbeResult?.total_count ?? null,
+      };
+      pushActivity('success', `${merged.length} videos · ready`);
+      // Empty entries surface an inline error instead of opening a useless picker.
+      if (merged.length === 0) {
+        listProbeResult = null;
+        probeState = 'error';
+        probeError = `No videos found for this ${res.type === 'search' ? 'search' : 'playlist'}.`;
+      } else {
+        // Notify parent so it can switch activeView to 'picker'.
+        dispatch('playlist', listProbeResult);
+      }
+    } else {
+      probeState = 'error';
+      probeError = res.code === 'UNSUPPORTED_PLATFORM'
+        ? 'This URL is not supported.'
+        : (res.message || 'Could not load URL.');
+      pushActivity('error', `${res.code || 'ERROR'} · ${res.message || ''}`);
+    }
+
+    // Cache successful results (F14) so re-paste is instant. Errors and
+    // empty results are not cached — the user should see a fresh probe
+    // next time.
+    if (res.type && res.type !== 'error' && invokeFn) {
+      invokeFn('cache_probe', { url: probeUrl, result: res }).catch(() => {});
+    }
+  }
+
+  /** Bypass the cache and force a fresh probe. Called from the strip's Refresh button. */
+  async function handleRefreshProbe() {
+    if (!url || !invokeFn) return;
+    try {
+      await invokeFn('invalidate_probe', { url });
+    } catch {}
+    cacheAge = null;
+    runProbe(url);
   }
 
   function onUrlChange(newUrl) {
@@ -118,6 +331,39 @@
     debounceTimer = setTimeout(() => {
       runProbe(newUrl);
     }, 800);
+  }
+
+  /**
+   * Fetch the next page of playlist/channel entries and append them to the
+   * existing list (never replacing what's already loaded). `page_start`/
+   * `page_end` are 1-indexed, continuing right after the entries already on
+   * screen.
+   */
+  async function handleLoadMore() {
+    if (!invokeFn || !listProbeResult || loadingMore) return;
+    const pageStart = listProbeResult.entries.length + 1;
+    const pageEnd = pageStart + 19; // 20-entry page, matches PLAYLIST_PAGE_SIZE
+    loadingMore = true;
+    loadMoreError = false;
+    try {
+      const res = await invokeFn('probe_url_page', { url, page_start: pageStart, page_end: pageEnd });
+      if (res.type === 'page' && Array.isArray(res.entries)) {
+        const existing = listProbeResult.entries ?? [];
+        const seen = new Set(existing.map((/** @type {any} */ e) => e.id));
+        const newEntries = res.entries.filter((/** @type {any} */ e) => e.id && !seen.has(e.id));
+        listProbeResult = {
+          ...listProbeResult,
+          entries: [...existing, ...newEntries],
+          total_count: res.total_count ?? listProbeResult.total_count,
+        };
+      } else {
+        loadMoreError = true;
+      }
+    } catch (e) {
+      loadMoreError = true;
+    } finally {
+      loadingMore = false;
+    }
   }
 
   let prevUrl = '';
@@ -132,6 +378,10 @@
 
   onDestroy(() => {
     cancelDebounce();
+    if (probeActivityUnlisten) {
+      try { probeActivityUnlisten(); } catch {}
+      probeActivityUnlisten = null;
+    }
   });
 
   function handleTranscribe() {
@@ -139,8 +389,23 @@
     dispatch('transcribe');
   }
 
+  /**
+   * Called when the user clicks "Transcribe N videos →" in picker mode.
+   * Uses the picker's own selection (kept in sync via `selectionChange`)
+   * instead of relying on the picker's internal startJob button — this is
+   * the footer action-bar button, a separate UI element from the one
+   * inside VideoPicker itself. Previously this dispatched an event nobody
+   * handled, so clicking it silently did nothing (F12 spec section C).
+   *
+   * Also invalidates the probe cache for the source URL so the next paste
+   * of the same URL triggers a fresh probe (catches newly added videos).
+   */
   function handleTranscribePicker() {
-    dispatch('transcribePicker');
+    if (selectedPickerEntries.length === 0) return;
+    if (url && invokeFn) {
+      invokeFn('invalidate_probe', { url }).catch(() => {});
+    }
+    handlePickerStartJob(selectedPickerEntries);
   }
 
   /**
@@ -159,126 +424,99 @@
 
 <section class="url-panel">
   {#if activeView === 'transcribe' || activeView === 'picker'}
+    <!-- F14: in picker mode, the URL input collapses to a single line
+         pinned at the top so the user always sees what they pasted
+         even when the picker below scrolls. The activity strip and
+         source hint are dropped here (the picker is the result, no
+         need for either). Below the URL is the picker, scrollable. -->
     {#if pickerMode && listProbeResult}
-      <VideoPicker
-        entries={listProbeResult.entries ?? []}
-        playlistTitle={listProbeResult.kind === 'search' ? '' : (listProbeResult.title ?? '')}
-        searchQuery={listProbeResult.kind === 'search' ? (listProbeResult.query ?? '') : ''}
-        kind={listProbeResult.kind}
-        on:selectionChange={(e) => (selectedCount = e.detail.count)}
-        on:startJob={(e) => handlePickerStartJob(e.detail.selected)}
-      />
-    {/if}
-    <div class="panel-section">
-      <header class="section-header">
-        <h3 class="section-title">Source</h3>
-      </header>
-      <UrlDropZone bind:value={url} placeholder="Paste a video URL or drop one here…" {loading} />
-      {#if pickerMode && probeState !== 'error'}
-        <!-- Playlist mode hint shown in picker state -->
-      {:else if probeState === 'probing'}
-        <p class="section-hint probing">
-          <span class="spinner-inline"></span>
-          Checking URL…
-        </p>
-      {:else if probeState === 'error'}
-        <p class="section-hint error">{probeError}</p>
-      {:else if !pickerMode}
-        <p class="section-hint">YouTube · Instagram · TikTok · Twitter/X · 1000+ more</p>
-      {/if}
-
-      {#if duplicateMatch}
-        <div class="duplicate-notice">
-          <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-            <circle cx="8" cy="8" r="6.5" stroke="currentColor" stroke-width="1.4"/>
-            <path d="M8 5v3.5M8 11h.01" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
-          </svg>
-          <span class="dup-text">
-            {#if duplicateMatch.priorStatus === 'done'}
-              Already transcribed: <strong>{duplicateMatch.title.length > 40 ? duplicateMatch.title.slice(0, 40) + '…' : duplicateMatch.title}</strong>
-            {:else if duplicateMatch.priorStatus === 'failed'}
-              Previous attempt failed: <strong>{duplicateMatch.title.length > 40 ? duplicateMatch.title.slice(0, 40) + '…' : duplicateMatch.title}</strong>
-            {:else if duplicateMatch.priorStatus === 'cancelled'}
-              Previous attempt was cancelled: <strong>{duplicateMatch.title.length > 40 ? duplicateMatch.title.slice(0, 40) + '…' : duplicateMatch.title}</strong>
-            {:else}
-              Already in history: <strong>{duplicateMatch.title.length > 40 ? duplicateMatch.title.slice(0, 40) + '…' : duplicateMatch.title}</strong>
-            {/if}
-          </span>
-        </div>
-      {/if}
-
-      {#if probeState === 'preview' && probeResult}
-        <div class="preview-card">
-          <div class="preview-thumb-wrap">
-            <img
-              class="preview-thumb"
-              src={probeResult.thumbnail}
-              alt={probeResult.title}
-              on:error={(e) => { e.currentTarget.style.display = 'none'; e.currentTarget.nextElementSibling.style.display = 'grid'; }}
-            />
-            <div class="preview-thumb-placeholder" style="display:none">
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                <rect x="2" y="4" width="20" height="16" rx="2" stroke="currentColor" stroke-width="1.4"/>
-                <path d="M10 9l5 3-5 3V9z" fill="currentColor"/>
-              </svg>
-            </div>
-          </div>
-          <div class="preview-meta">
-            <p class="preview-title">{probeResult.title}</p>
-            <p class="preview-sub">
-              {#if probeResult.uploader}<span>{probeResult.uploader}</span>{/if}
-              {#if probeResult.uploader && probeResult.duration}<span class="dot-sep"> · </span>{/if}
-              {#if probeResult.duration}<span>{formatDuration(probeResult.duration)}</span>{/if}
-            </p>
-          </div>
-        </div>
-      {/if}
-    </div>
-
-    <div class="panel-section">
-      <header class="section-header">
-        <h3 class="section-title">Options</h3>
-      </header>
-      <label class="toggle-row">
-        <div class="toggle" class:on={timestamps}>
-          <input type="checkbox" bind:checked={timestamps} disabled={loading} />
-          <span class="thumb"></span>
-        </div>
-        <span class="toggle-label">Include timestamps</span>
-      </label>
-    </div>
-
-    {#if !pickerMode}
-      <div class="panel-section status-section">
-        <header class="section-header">
-          <h3 class="section-title">Status</h3>
-        </header>
-        <div class="status-row">
-          {#if errorMessage}
-            <span class="status-dot error"></span>
-            <span class="status-text error">{errorMessage}</span>
-          {:else if loading}
-            <span class="status-dot pulse"></span>
-            <span class="status-text">
-              {#if phase === 'downloading' && modelProgress !== null}
-                Downloading model · {Math.round(modelProgress * 100)}%
-              {:else if phase === 'downloading'}
-                Downloading audio…
-              {:else if phase === 'transcribing'}
-                Transcribing…
-              {:else}
-                Working…
-              {/if}
-            </span>
-          {:else if language}
-            <span class="status-dot ready"></span>
-            <span class="status-text">Last run · <strong>{language.toUpperCase()}</strong></span>
-          {:else}
-            <span class="status-dot idle"></span>
-            <span class="status-text">Idle</span>
-          {/if}
-        </div>
+      <div class="picker-url-line">
+        <UrlDropZone bind:value={url} placeholder="Paste a video URL or drop one here…" {loading} />
       </div>
+      <div class="picker-scroll">
+        <VideoPicker
+          entries={listProbeResult.entries ?? []}
+          playlistTitle={listProbeResult.kind === 'search' ? '' : (listProbeResult.title ?? '')}
+          searchQuery={listProbeResult.kind === 'search' ? (listProbeResult.query ?? '') : ''}
+          kind={listProbeResult.kind}
+          totalCount={listProbeResult.total_count ?? null}
+          {loadingMore}
+          {loadMoreError}
+          {transcribedUrls}
+          on:selectionChange={(e) => { selectedCount = e.detail.count; selectedPickerEntries = e.detail.selected; }}
+          on:startJob={(e) => handlePickerStartJob(e.detail.selected)}
+          on:loadMore={handleLoadMore}
+        />
+      </div>
+    {:else}
+      <!-- Non-picker mode: full URL input section with activity strip
+           underneath (the original F14 layout). -->
+      <div class="panel-section">
+        <header class="section-header">
+          <h3 class="section-title">Source</h3>
+        </header>
+        <UrlDropZone bind:value={url} placeholder="Paste a video URL or drop one here…" {loading} />
+        {#if probeState === 'error'}
+          <p class="section-hint error">{probeError}</p>
+        {:else if !pickerMode}
+          <p class="section-hint">YouTube · Instagram · TikTok · Twitter/X · 1000+ more</p>
+        {/if}
+        <!-- F14: live probe feedback strip. Shows real-time status and
+             stays put until the picker takes over (then disappears). -->
+        {#if probeState === 'probing' || probeState === 'error' || probeActivity.length > 0}
+          <ProbeActivityStrip
+            messages={probeActivity}
+            cacheAge={cacheAge}
+            onRefresh={handleRefreshProbe}
+          />
+        {/if}
+      </div>
+
+      <div class="panel-section">
+        <header class="section-header">
+          <h3 class="section-title">Options</h3>
+        </header>
+        <label class="toggle-row">
+          <div class="toggle" class:on={timestamps}>
+            <input type="checkbox" bind:checked={timestamps} disabled={loading} />
+            <span class="thumb"></span>
+          </div>
+          <span class="toggle-label">Include timestamps</span>
+        </label>
+      </div>
+
+      {#if !pickerMode}
+        <div class="panel-section status-section">
+          <header class="section-header">
+            <h3 class="section-title">Status</h3>
+          </header>
+          <div class="status-row">
+            {#if errorMessage}
+              <span class="status-dot error"></span>
+              <span class="status-text error">{errorMessage}</span>
+            {:else if loading}
+              <span class="status-dot pulse"></span>
+              <span class="status-text">
+                {#if phase === 'downloading' && modelProgress !== null}
+                  Downloading model · {Math.round(modelProgress * 100)}%
+                {:else if phase === 'downloading'}
+                  Downloading audio…
+                {:else if phase === 'transcribing'}
+                  Transcribing…
+                {:else}
+                  Working…
+                {/if}
+              </span>
+            {:else if language}
+              <span class="status-dot ready"></span>
+              <span class="status-text">Last run · <strong>{language.toUpperCase()}</strong></span>
+            {:else}
+              <span class="status-dot idle"></span>
+              <span class="status-text">Idle</span>
+            {/if}
+          </div>
+        </div>
+      {/if}
     {/if}
   {:else if activeView === 'history'}
     <div class="panel-section">
@@ -297,6 +535,10 @@
   {/if}
 </section>
 
+<!-- Action bar: sticky at the bottom of the panel so the
+     "Transcribe N videos →" button is always visible, no matter
+     how long the picker scrolls. Sits below .url-panel which has
+     min-height:0 + flex so the parent flex column pins it. -->
 <footer class="action-bar">
   {#if loading}
     <button type="button" class="btn-stop" on:click={handleCancel}>
@@ -355,6 +597,11 @@
 </footer>
 
 <style>
+  /* The .url-panel is the scrollable region inside the left pane; the
+     footer .action-bar (defined further down) is the next flex sibling
+     pinned at the bottom. Picker mode replaces .url-panel's scroll
+     region with a contained .picker-scroll so the picker doesn't push
+     the action bar off-screen. */
   .url-panel {
     flex: 1;
     display: flex;
@@ -363,6 +610,35 @@
     padding: 18px 20px 0;
     gap: 22px;
     min-height: 0;
+  }
+
+  /* Picker mode: URL line + scrollable picker. The .picker-scroll is
+     the only scrollable region in this layout — the parent flex
+     column keeps the action bar pinned at the bottom regardless of
+     how many entries the picker has. */
+  .picker-url-line {
+    flex-shrink: 0;
+    padding-bottom: 12px;
+  }
+  /* Compact URL input in picker mode — drop the full Source section
+     chrome (label, hint, padding). Looks like a single-line pill. */
+  .picker-url-line :global(.drop-zone) {
+    padding: 8px 14px;
+  }
+  .picker-url-line :global(.drop-zone .dropzone-content) {
+    gap: 8px;
+  }
+
+  .picker-scroll {
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    /* Negative margin lets the picker fill to the very bottom of the
+       scroll region (the action-bar above this provides the visual
+       bottom border via its own top-border). */
+    margin-bottom: -1px;
   }
 
   .panel-section {

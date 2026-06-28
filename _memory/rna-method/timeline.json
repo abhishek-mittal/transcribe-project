@@ -1,0 +1,89 @@
+{
+  "meta": {
+    "project": "transcribe-project",
+    "lastUpdated": "2026-06-28",
+    "currentPhase": "MVP — get a working app first",
+    "projectDescription": "Web app that transcribes audio from URLs using yt-dlp + faster-whisper (Python serverless API) with a SvelteKit/TypeScript frontend, deployed to Vercel.",
+    "projectName": "transcribe-project"
+  },
+  "teamProfiles": [
+    {
+      "agentId": "developer",
+      "name": "Developer",
+      "role": "Full-Stack Developer",
+      "lastActive": "2026-05-29",
+      "lastTask": "rna.setup"
+    },
+    {
+      "agentId": "reviewer",
+      "name": "Reviewer",
+      "role": "Code Reviewer & Quality Gate",
+      "lastActive": "2026-05-29",
+      "lastTask": "rna.setup"
+    },
+    {
+      "agentId": "architect",
+      "name": "Architect",
+      "role": "System Architect & Optimization Lead",
+      "lastActive": "2026-05-29",
+      "lastTask": "rna.setup"
+    },
+    {
+      "agentId": "director",
+      "name": "Director",
+      "role": "Routing & Orchestration",
+      "lastActive": "2026-05-29",
+      "lastTask": "rna.setup"
+    }
+  ],
+  "projectState": {
+    "techStack": {
+      "language": "Python + TypeScript + Rust",
+      "framework": "Tauri 2 desktop shell + SvelteKit UI + bundled Python sidecar",
+      "transcription": "faster-whisper",
+      "audioFetch": "yt-dlp"
+    },
+    "activeAreas": [
+      "Cross-tool agent coordination: AGENTS.md, __handovers__/, tracked _memory/"
+    ],
+    "knownDecisions": [
+      {
+        "date": "2026-06-28",
+        "agent": "developer",
+        "decision": "Stopped gitignoring _memory/ and added AGENTS.md + __handovers__/CURRENT.md as the cross-tool (Claude Code / Copilot / OpenCode) session continuity mechanism.",
+        "rationale": "_memory/ was gitignored by RNA's installer default, so it never left the machine it was written on and couldn't function as shared state across tools or clones. __handovers__/ existed but was empty and unused."
+      },
+      {
+        "date": "2026-06-28",
+        "agent": "developer",
+        "decision": "Fixed 'sidecar binary missing' in src-tauri/src/lib.rs sidecar_path() — TWO distinct path bugs. (1) Inner binary name: code joined the resource-dir name onto itself (…/transcribe-sidecar-aarch64-apple-darwin) but PyInstaller names the inner binary just 'transcribe-sidecar'; added SIDECAR_BINARY_NAME const. (2) Missing 'binaries/' prefix: SIDECAR_RESOURCE_DIR omitted the binaries/ prefix, so resolve(Resource) pointed at target/debug/transcribe-sidecar-…/ but Tauri preserves the bundle.resources source structure and actually places it at target/debug/binaries/transcribe-sidecar-…/; changed the const to 'binaries/transcribe-sidecar-aarch64-apple-darwin'.",
+        "rationale": "Tauri's bundle.resources preserves source dir structure (incl. the binaries/ prefix) when copying resources, and PyInstaller's --name (not the dir name) is the inner binary. cargo check passes; resolved dev path verified present + executable. Full UI smoke still pending (port 5173 was held by a pre-existing dev instance during verification)."
+      },
+      {
+        "date": "2026-06-28",
+        "agent": "developer",
+        "decision": "Fixed Instagram reel-URL misclassification in api/transcribe_core.py _is_instagram_profile_url(): it only checked segments[0] for a post keyword (reel/p/tv/stories), so username-prefixed reel URLs (instagram.com/<user>/reel/<id> — IG's current share-link format) were wrongly classified as profile pages and blocked with IG_PROFILE_UNSUPPORTED. Changed to scan all segments except the last for a post keyword, since an individual post always has the keyword immediately followed by an id segment regardless of username prefix.",
+        "rationale": "Verified against 12 enumerated URL shapes (profile, reels-tab, bare/username-prefixed reel/p/tv/stories) — all classify correctly, including the user's exact reported URL. Live-tested the downstream oEmbed call against the real URL and got a successful response, confirming the full probe pipeline (not just the classifier) works. No pytest harness exists for api/ in this repo — verification used ad-hoc python3 -c scripts; flagged as a backlog gap in __handovers__/CURRENT.md."
+      },
+      {
+        "date": "2026-06-28",
+        "agent": "developer",
+        "decision": "F14 Progressive Picker + Probe Cache + Visible Activity. Three coordinated changes addressing 'picker takes too long, no UI feedback, re-paste is slow' for slow URLs like https://www.youtube.com/@MillieAdrian/shorts: (1) Python sidecar INITIAL_PAGE_SIZE 20→5 (extract_flat='in_playlist' over a 100+ Shorts channel took 5–10s before; now ~1.5s for the user's URL), with new process_info callback emitting per-entry events that yt-dlp never fires for in_playlist mode (kept as best-effort). (2) New probe_cache SQLite table (TTL 15 min) — re-paste same URL is instant; invalidated on 'Transcribe X videos' click. (3) New Tauri 'probe-activity' event channel that streams sidecar stdout to the UI; replaces eprintln!-only feedback with a live ProbeActivityStrip (mono 10.5px, severity color, Refresh link). Frontend listens for entry events and appends rows live (works when yt-dlp exposes them; falls back to the final-result merge path otherwise).",
+        "rationale": "Verified standalone: full probe for the user's URL completes in 1.465s end-to-end (was: 5–10s of waiting with only terminal output). Rust unit tests 14/14 pass (4 new probe_cache tests + 10 existing, schema test confirms the new probe_cache table is created alongside settings/history/jobs/job_items). svelte-check found 0 errors in the new ProbeActivityStrip.svelte and UrlInputPanel.svelte F14 additions. Not yet verified in the running app (npm run tauri:dev not started this session). Spec at __specs__/F14-progressive-picker-cache.md."
+      },
+      {
+        "date": "2026-06-28",
+        "agent": "developer",
+        "decision": "F14 UX polish (Phase 2): addressed two user complaints — (a) activity strip showed 'Probe ready' without context, clobbering the more informative 'N videos · ready · cached Xm ago' message that handleProbeResult pushes from the final probe result; (b) in picker mode, the URL input + activity strip pushed the VideoPicker + action bar off-screen for short left-pane heights. Fix 1: removed the redundant 'Probe ready' push in handleProbeActivityEvent's done branch — the Rust bridge delivers event:done to the webview before the probe_url invoke resolves, so the listener ran first and stomped the better message. Fix 2: split UrlInputPanel template into pickerMode / non-picker branches; in picker mode, render a compact URL input at the top (.picker-url-line, flex-shrink:0) and wrap VideoPicker in .picker-scroll (flex:1, overflow:hidden) so it scrolls inside its own height while the action bar stays pinned to the parent flex column's bottom.",
+        "rationale": "Verified by svelte-check (no new errors), cargo check (no Rust changes), and re-verified standalone probe timing 1.465s. Not yet verified in the running app — visual confirmation deferred to next session. Files: src/lib/desktop/UrlInputPanel.svelte (template restructure + 2 new CSS classes), __handovers__/CURRENT.md session 4 entry."
+      }
+    ],
+    "openQuestions": [
+      "Project pivoted from SvelteKit+Vercel-serverless to Tauri desktop + bundled sidecar at some point after RNA setup (2026-05-29) — .rna/rna-schema.json was never regenerated to reflect this. Worth re-running the RNA adapter, or just treating AGENTS.md/README.md as the corrected source of truth going forward?",
+      "__specs__/INDEX.md references transcribe-handoff.md as the architecture reference doc, but that file does not exist in the repo. Lost, renamed, or never committed?"
+    ]
+  },
+  "signalQueue": [],
+  "completedJoins": []
+}
+
