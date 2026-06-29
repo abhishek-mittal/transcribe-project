@@ -50,13 +50,7 @@ Architecture reference: `projects/transcribe-project/transcribe-handoff.md`
 | 16 | [FIX-08](FIX-08-instagram-reels-plural-oembed-400.md) | Instagram `/reels/<id>/` (plural) oEmbed 400 | P0 | — |
 | 17 | [FIX-09](FIX-09-safari-cookie-permission-during-download.md) | Safari Cookie PermissionError Surfaces as Generic INTERNAL | P0 | — |
 
-**Blocked — needs reproduction before implementation, do not guess a fix**
-
-| Spec | Title | Status |
-|---|---|---|
-| [FIX-10](FIX-10-youtube-shorts-int-crash-NEEDS-REPRO.md) | YouTube `/shorts` tab `int('')` ValueError | Unconfirmed — investigation dead-ends recorded, needs real traceback from a repro or the original UAT session's logs |
-
-**Resolved — see archived OpenSpec change**
+**Resolved — fixed, shipped, awaiting field confirmation**
 
 FFmpeg bundling (previously required `brew install ffmpeg` on a clean machine) was
 implemented and shipped in v0.1.1 — see
@@ -64,6 +58,14 @@ implemented and shipped in v0.1.1 — see
 proposal/design/specs/tasks. `ffmpeg`/`ffprobe` now ship inside the app bundle;
 `api/sidecar.py`'s `resolve_ffmpeg()` resolves the bundled binary when frozen, falls
 back to PATH in dev mode. Verified end-to-end with PATH stripped of all ffmpeg.
+
+[FIX-10](FIX-10-mac-ver-int-crash.md) — `platform.mac_ver()` crash on every probe/download
+attempt on some macOS versions (`invalid literal for int() with base 10: ''`). Initially
+suspected `/shorts`-specific from a UAT screenshot; root-caused once a second report
+showed it hit every URL type, plus a real traceback captured by running the app directly
+from Terminal. Fixed in `api/sidecar.py` (patches `platform.mac_ver()` before `yt_dlp`
+is imported). DMG asset on the existing v0.1.1 GitHub release was overwritten in place
+with the fix. Not yet confirmed by the originally affected user re-testing.
 
 ---
 

@@ -1,88 +1,87 @@
 # Handover — 2026-06-29 — claude-code
 
 ## Status
-Done — `bundle-ffmpeg-sidecar` OpenSpec change implemented, verified end-to-end,
-and shipped as GitHub release v0.1.1 + matching Notion entry. 22/25 tasks
-checked off in `tasks.md`; remaining 3 are this close-out step (now also done).
-Ready to archive the OpenSpec change.
+Done — FIX-10 (the `int('')` crash, previously blocked on missing reproduction
+evidence) is root-caused and fixed. Pushed to `main` (`37b703d`). DMG asset on
+the existing v0.1.1 GitHub release was overwritten in place (no new tag cut,
+per explicit instruction). Notion entry updated to match. **Not yet confirmed
+against the real affected M2 hardware** — verified by simulating the exact
+broken input, not by the user re-testing the new build.
 
 ## What changed this session
-- `scripts/fetch_ffmpeg.py` (new) — downloads pinned ffmpeg/ffprobe 8.1.2 from
-  evermeet.cx (exact versioned URLs, not the floating `getrelease` redirect),
-  extracts, chmods, and verifies each binary actually runs (`-version`) before
-  returning — raises loudly on any failure so a build can never silently ship
-  without working ffmpeg.
-- `scripts/build_sidecar.py` — now calls `fetch_ffmpeg_binaries()` after moving
-  the PyInstaller `--onedir` output into place, so `npm run sidecar:build`
-  bundles ffmpeg/ffprobe automatically with no extra manual step.
-- `api/sidecar.py` — `check_ffmpeg()` replaced with `resolve_ffmpeg() -> str`:
-  checks `<exe_dir>/ffmpeg` when frozen (PyInstaller build), falls back to
-  `shutil.which("ffmpeg")` otherwise (dev mode, unchanged). All 3 call sites
-  updated; the two that call `download_audio` now pass the resolved path.
-- `api/transcribe_core.py` — `download_audio()` gained an `ffmpeg_location: Optional[str] = None`
-  parameter, sets `ydl_opts["ffmpeg_location"]` when provided. Flask's call
-  sites don't pass it — fully backward compatible, zero behavior change there.
-- `api/__tests__/` (new) — first pytest harness in this repo (pytest installed
-  into `.venv`, none existed before). 5 tests, all passing:
-  `test_ffmpeg_resolution.py` (3), `test_ffmpeg_location.py` (2).
-- `src-tauri/tauri.conf.json` — version bumped 0.1.0 → 0.1.1 (no other changes
-  needed — the existing `bundle.resources` directory entry picked up the new
-  binaries automatically, confirmed by inspecting the built `.app`).
-- Built and published **GitHub release v0.1.1**
-  (https://github.com/abhishek-mittal/transcribe-project/releases/tag/v0.1.1)
-  with the new DMG (~159MB, up from ~100MB in v0.1.0). Added a matching row to
-  the Notion "App Versions" tracker (under Transcribe APP page) with the
-  download link.
-- `_memory/rna-method/timeline.json` — new `recentDecisions[]` entry; 2 new
-  `openQuestions[]` (Cargo.toml version still says 0.1.0 — cosmetic mismatch;
-  evermeet.cx binaries are x86_64-via-Rosetta, not native arm64).
-
-## How this was verified (not just unit tests)
-Ran the **real frozen** `transcribe-sidecar` binary directly with `PATH`
-stripped to `/usr/bin:/bin` (no Homebrew, no system ffmpeg anywhere):
-1. Confirmed it got past `resolve_ffmpeg()` cleanly (no `FFMPEG_MISSING`) on a
-   request to an intentionally-unreachable URL — proved the ffmpeg gate passes
-   before ever touching the network.
-2. Ran a full real download against a real public YouTube video
-   (`jNQXAC9IVRw`) — yt-dlp downloaded the stream, the *bundled* ffmpeg's
-   `FFmpegExtractAudio` postprocessor transcoded it to mp3, sidecar emitted
-   `download-done`, and the output file was confirmed valid via `ffprobe`
-   (128kbps MP3, proper ID3 tags). This is the strongest possible proof short
-   of a literal clean VM — the bundled binary is what actually ran, not a
-   PATH fallback that happened to also be present.
-3. Confirmed dev-mode (unfrozen) resolution still correctly falls back to
-   PATH (`/opt/homebrew/bin/ffmpeg` on this machine) — no regression for
-   `tauri:dev`/`dev:all`.
+- Got the real evidence first. User reported v0.1.1 still crashing with
+  `invalid literal for int() with base 10: ''` on an M2 Mac — but now on
+  **every URL type**, not just `/shorts` like the original UAT screenshot.
+  That single fact (every URL, not one shape) was the key signal something
+  systemic was wrong, not a yt-dlp parsing edge case for one channel-tab URL.
+- First log-path guess was wrong: told the user to check
+  `~/Library/Application Support/com.shuhari.transcribe/sidecar.log` — that
+  file never gets created there. Correct path (per `src-tauri/src/lib.rs`,
+  `app_log_dir()` not `app_data_dir()`) is
+  `~/Library/Logs/com.shuhari.transcribe/sidecar.log` — but that was also
+  empty on their machine (the log-file open likely failed silently, `.ok()`
+  swallows the error). Live capture was the only path that worked: had them
+  run `/Applications/Transcribe.app/Contents/MacOS/transcribe` directly from
+  Terminal so stderr prints live, then use the app normally.
+- **Real root cause** (from the actual traceback): `platform.mac_ver()[0]`
+  returns a malformed version string on some macOS versions (an empty/blank
+  dot-separated segment). yt-dlp's plugin discovery
+  (`yt_dlp/update.py:_get_variant_and_executable_path`, called unconditionally
+  the first time *any* `YoutubeDL()` is constructed — explaining why it hit
+  every URL) calls `version_tuple()` on that string WITHOUT yt-dlp's own
+  `lenient=True` option, so `int('')` raises. Reproduced by simulating the
+  exact broken `mac_ver()` output locally and confirming the same crash, then
+  confirming the fix prevents it.
+- `api/sidecar.py` — patches `platform.mac_ver()` before `import yt_dlp`,
+  normalizing any malformed release string to `"0.0.0"` if it has an
+  empty/blank segment, passing through valid strings unchanged.
+- `api/__tests__/test_mac_ver_workaround.py` (new) — 2 tests, both passing.
+  Full suite now 7/7.
+- Rebuilt sidecar + DMG, verified integrity, **overwrote the existing
+  v0.1.1 GitHub release asset in place** (`gh release delete-asset` +
+  `gh release upload`, not a new tag) and updated its release notes. Updated
+  the matching Notion "App Versions" row's Fixed Bugs / Dev Notes.
+- `_memory/rna-method/timeline.json` updated; FIX-10's old "needs repro"
+  open question removed, replaced with "waiting on M2 user to confirm fix."
 
 ## Next action
-Run `/opsx:archive` (or equivalent) for `bundle-ffmpeg-sidecar` now that all
-25 tasks are checked off and verified — syncs the `python-sidecar` delta spec
-into `openspec/specs/`. Then move on to FIX-08 and FIX-09 (both root-caused
-last session, ready to implement, see `__specs__/INDEX.md` Track 5).
+**Tell the M2 user to redownload the v0.1.1 DMG from the same link** (the
+asset was overwritten, same URL:
+https://github.com/abhishek-mittal/transcribe-project/releases/download/v0.1.1/Transcribe_0.1.1_aarch64.dmg)
+and re-test. If their browser/Finder cached the old download, they may need
+to force a fresh download (not just re-open a previously-downloaded copy).
+Once confirmed, FIX-10 can be marked fully closed — until then, treat it as
+"fixed but unconfirmed on the affected hardware."
 
 ## Do NOT
-- Don't re-pick a different ffmpeg source without re-verifying end-to-end —
-  evermeet.cx 8.1.2 was deliberately pinned (not "latest") and tested; a
-  silent version bump would need the same `-version` + real-download
-  verification redone, not just a URL swap.
-- Don't assume the DMG size growth (~60MB) needs trimming — it was an
-  explicit, accepted trade-off in `design.md`'s Risks section for a genuinely
-  self-contained desktop app; don't "optimize" it away by going back to a
-  PATH-dependent or first-run-download approach (both were explicitly
-  considered and rejected this session).
-- Don't touch `src-tauri/Cargo.toml`'s version field reflexively to "fix" the
-  0.1.0/0.1.1 mismatch with `tauri.conf.json` unless you're already touching
-  that file for another reason — flagged as a cosmetic open question, not
-  urgent.
+- Don't tell anyone the sidecar log is at `~/Library/Application Support/...`
+  — that was this session's own wrong guess, corrected to
+  `~/Library/Logs/com.shuhari.transcribe/sidecar.log` (per `app_log_dir()` in
+  `src-tauri/src/lib.rs`). Even that path can come up empty if the log file
+  failed to open — the Terminal-direct-launch method
+  (`/Applications/Transcribe.app/Contents/MacOS/transcribe`) is the reliable
+  fallback, not a last resort.
+- Don't assume this is the only macOS-version-sensitive landmine in yt-dlp.
+  The same class of bug (yt-dlp code that doesn't defensively handle OS
+  quirks) could exist elsewhere — if another "crashes on some machines but
+  not others" report comes in, check whether it's similarly OS-version- or
+  environment-sensitive before assuming it's URL-specific.
+- Don't re-cut a new version tag for DMG fixes unless asked — this session
+  overwrote the v0.1.1 asset in place per explicit instruction, diverging
+  from the v0.1.0→v0.1.1 pattern (new tag) used for the ffmpeg fix. Ask which
+  approach is wanted each time rather than assuming.
 
 ## Open questions / blockers
-- FIX-10 (YouTube `/shorts` `int('')` crash) still needs a real traceback —
-  unrelated to this session's work, carried over from the previous session.
-- Cargo.toml/tauri.conf.json version mismatch (cosmetic).
-- No native arm64 ffmpeg source found yet; x86_64-via-Rosetta works correctly
-  but isn't the "purest" possible solution.
+- Unconfirmed on real affected hardware — see Next action.
+- `src-tauri/Cargo.toml` version still says 0.1.0 vs `tauri.conf.json`'s
+  0.1.1 (cosmetic, carried over from last session).
+- FIX-08 (Instagram `/reels/` plural) and FIX-09 (Safari cookie permission)
+  remain open, root-caused last session, not yet implemented.
 
 ## Related
-- OpenSpec change: `bundle-ffmpeg-sidecar` — 25/25 tasks complete, ready to archive
-- __specs__ files: FIX-08, FIX-09 (ready to implement, untouched this session), FIX-10 (still blocked)
+- OpenSpec change: none this session (FIX-10 was a `__specs__`-grain fix, not OpenSpec)
+- __specs__ file: `FIX-10-youtube-shorts-int-crash-NEEDS-REPRO.md` — title is now
+  stale (it's fixed, not blocked) but not renamed this session; consider
+  renaming to drop `-NEEDS-REPRO` and updating its content to reflect the
+  actual fix next time it's touched.
 - _memory/rna-method/timeline.json updated: yes
