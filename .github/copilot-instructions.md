@@ -2,6 +2,13 @@
 
 > Auto-generated from RNA schema v1.0.0. Edit `.rna/rna-schema.json` and re-run the adapter to update.
 
+> **Cross-tool note:** `AGENTS.md` at the repo root is read alongside this file and is
+> the shared source of truth across Claude Code, Copilot, and OpenCode — session
+> start/end protocol, `__handovers__/CURRENT.md`, and which planning system
+> (OpenSpec / `__specs__` / `_memory`) to use for what. The Project Context table below
+> is stale in places (still says Vercel serverless; the project moved to Tauri desktop +
+> bundled sidecar) — `AGENTS.md` has the corrected description.
+
 ## Project Context
 
 | Field | Value |
@@ -30,6 +37,9 @@ Before responding, check if the request matches an existing rule, skill, or agen
 | Reviewer | Code Reviewer & Quality Gate | `/review <task>` |
 | Architect | System Architect & Optimization Lead | `/arch <task>` |
 | Director | Routing & Orchestration | `/director <task>` |
+| Designer | UI/UX & Design System | `/designer <task>` |
+| Ops | Operator / Automation Specialist | `/ops <task>` |
+| Researcher | Explorer / Researcher | `/researcher <task>` |
 
 ## Available Skills
 
@@ -37,6 +47,16 @@ Before responding, check if the request matches an existing rule, skill, or agen
 |-------|-------------|------------------|
 | Smart Dev Agent | developer | implement, build, fix, debug, optimize, refactor |
 | Design Quality | developer | audit UI, normalize, polish, critique, distill, harden, design quality |
+
+## Engineering Discipline
+
+These apply to every agent, regardless of which one is active:
+
+| Rule | When it applies |
+|------|------------------|
+| `tdd-workflow.instructions.md` | Before writing any implementation code — write a failing test first |
+| `systematic-debugging.instructions.md` | Before fixing any bug — reproduce, isolate, and confirm root cause first |
+| `verification-before-completion.instructions.md` | Before claiming anything is done, fixed, or passing — run it and show evidence |
 
 ## Slash Commands
 
@@ -46,6 +66,9 @@ Before responding, check if the request matches an existing rule, skill, or agen
 | `/review` | reviewer | Invoke Reviewer agent |
 | `/arch` | architect | Invoke Architect agent |
 | `/director` | director | Invoke Director (routing/orchestration) |
+| `/designer` | designer | Invoke Designer agent |
+| `/ops` | ops | Invoke Ops agent |
+| `/researcher` | researcher | Invoke Researcher agent |
 
 ## Session Protocol
 

@@ -1,0 +1,12 @@
+{
+  "servers": {
+    "tauri-mcp": {
+      "type": "stdio",
+      "command": "tauri-mcp",
+      "args": ["serve"],
+      "env": {
+        "TAURI_MCP_LOG_LEVEL": "info"
+      }
+    }
+  }
+}

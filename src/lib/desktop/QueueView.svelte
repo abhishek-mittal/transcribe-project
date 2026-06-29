@@ -1,13 +1,18 @@
 <script>
-  import { createEventDispatcher } from 'svelte';
-  import { fly } from 'svelte/transition';
-  import TranscriptPanel from './TranscriptPanel.svelte';
+  import { createEventDispatcher, afterUpdate } from 'svelte';
   import ActivityLogPanel from './ActivityLogPanel.svelte';
 
   /**
-   * @typedef {'waiting'|'starting'|'downloading'|'transcribing'|'done'|'failed'|'cancelled'} JobItemStatus
-   * @typedef {{ id: string, url: string, title: string, thumbnail: string, duration: number, status: JobItemStatus, error: string|null, errorCode: string|null, result: any, startedAt: string|null, completedAt: string|null, wordCount: number|null, downloadPercent?: number|null, downloadedBytes?: number|null, totalBytes?: number|null, speedBps?: number|null, etaSecs?: number|null, streamSegments?: any[] }} JobItem
+   * @typedef {'waiting'|'starting'|'downloading'|'downloaded'|'transcribing'|'done'|'failed'|'cancelled'} JobItemStatus
+   * @typedef {{ id: string, url: string, title: string, thumbnail: string, duration: number, status: JobItemStatus, error: string|null, errorCode: string|null, result: any, startedAt: string|null, completedAt: string|null, wordCount: number|null, downloadPath?: string|null, downloadPercent?: number|null, downloadedBytes?: number|null, totalBytes?: number|null, speedBps?: number|null, etaSecs?: number|null, streamSegments?: any[] }} JobItem
    */
+
+  /**
+   * Mirrors DOWNLOAD_CHUNK_SIZE in +page.svelte's runPipelineJob — used
+   * only to compute the "↓ Batch N of M" header label below, not for any
+   * actual scheduling (that lives entirely in the pipeline runner).
+   */
+  const DOWNLOAD_CHUNK_SIZE = 5;
 
   /** @type {JobItem[]} */
   export let items = [];
@@ -19,50 +24,74 @@
   export let activityEntries = [];
   /** Callbacks for the activity log panel (Clear / Copy). */
   export let activityHandlers = {};
+  /** ID of the currently running item — logs expand inline below it. */
+  export let activeItemId = null;
 
   const dispatch = createEventDispatcher();
 
-  // Local tab state for the slide-in TranscriptPanel. Previously this was
-  // `export let activeTab` with `bind:activeTab` so the parent's tab state
-  // stayed in sync, but having three different components all bind to the
-  // same parent variable (transcribe tab, queue tab, history tab) caused
-  // Svelte 4's binding tracker to hold stale references across
-  // mount/unmount cycles and freeze the UI on Queue click. Now it's local.
-  /** @type {'plain'|'timestamped'|'srt'} */
-  let activeTab = 'plain';
-
-  function handleTabChange(t) {
-    activeTab = t;
-  }
-
-  /** @type {string | null} */
-  let selectedItemId = null;
-  let copied = false;
-
-  $: selectedItem = items.find((i) => i.id === selectedItemId) ?? null;
   $: doneCount = items.filter((i) => i.status === 'done').length;
-  $: allTerminal = items.length > 0 && items.every((i) => ['done', 'failed', 'cancelled'].includes(i.status)) && !items.some((i) => i.status === 'starting');
+  $: allTerminal = items.length > 0 && items.every((i) => ['done', 'failed', 'cancelled'].includes(i.status)) && !items.some((i) => ['starting', 'downloading', 'downloaded', 'transcribing'].includes(i.status));
 
-  function selectItem(item) {
-    if (item.status !== 'done') return;
-    selectedItemId = selectedItemId === item.id ? null : item.id;
-  }
+  /**
+   * Index of the currently-transcribing item (at most one, ever — the
+   * pipeline's transcription slot is single-flight). Doubles as "Video N
+   * of M" / "Transcribing #N" in the header and drives the
+   * scroll-into-view behaviour below. Falls back to the active download
+   * row when nothing is transcribing yet, so the row still scrolls into
+   * view during a download-only phase.
+   */
+  $: transcribingIndex = items.findIndex((i) => i.status === 'transcribing');
+  $: activeIndex = transcribingIndex !== -1
+    ? transcribingIndex
+    : items.findIndex((i) => ['starting', 'downloading'].includes(i.status));
 
-  function getActiveContent() {
-    if (!selectedItem?.result) return '';
-    if (activeTab === 'plain') return selectedItem.result.plain || '';
-    if (activeTab === 'timestamped') return selectedItem.result.timestamped || '';
-    if (activeTab === 'srt') return selectedItem.result.srt || '';
-    return '';
-  }
+  /** True while at least one item is actively downloading. */
+  $: isDownloadPhaseActive = items.some((i) => i.status === 'downloading' || i.status === 'starting');
+  /**
+   * "↓ Batch N of M" — N is derived from how many items have already left
+   * the download phase (done/failed/cancelled/downloaded/transcribing all
+   * count as "no longer waiting to download"), divided into
+   * DOWNLOAD_CHUNK_SIZE-sized batches. Purely a display computation; the
+   * pipeline runner in +page.svelte owns the actual chunk scheduling.
+   */
+  $: downloadBatchTotal = Math.max(1, Math.ceil(items.length / DOWNLOAD_CHUNK_SIZE));
+  $: downloadedOrBeyondCount = items.filter((i) =>
+    ['downloaded', 'transcribing', 'done', 'failed', 'cancelled'].includes(i.status)
+  ).length;
+  $: downloadBatchCurrent = Math.min(downloadBatchTotal, Math.floor(downloadedOrBeyondCount / DOWNLOAD_CHUNK_SIZE) + 1);
 
-  function handleCopy() {
-    const content = getActiveContent();
-    if (!content) return;
-    navigator.clipboard.writeText(content).then(() => {
-      copied = true;
-      setTimeout(() => (copied = false), 2000);
-    });
+  /** @type {HTMLElement | null} */
+  let activeRowEl = null;
+  let lastScrolledIndex = -1;
+
+  // Scroll the active row into view only when it *changes* (a new item
+  // started processing) — not on every reactive re-render, which would
+  // otherwise re-trigger the smooth scroll on each download-progress tick.
+  afterUpdate(() => {
+    if (activeIndex !== -1 && activeIndex !== lastScrolledIndex && activeRowEl) {
+      activeRowEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      lastScrolledIndex = activeIndex;
+    }
+  });
+
+  /**
+   * Svelte action: records this row's element as `activeRowEl` while it's
+   * the active row (`#each` loops can't conditionally `bind:this`, so this
+   * is the idiomatic way to capture a ref to "whichever row is active").
+   * @param {HTMLElement} node
+   * @param {boolean} isActiveRow
+   */
+  function bindActiveRow(node, isActiveRow) {
+    if (isActiveRow) activeRowEl = node;
+    return {
+      /** @param {boolean} nextIsActiveRow */
+      update(nextIsActiveRow) {
+        if (nextIsActiveRow) activeRowEl = node;
+      },
+      destroy() {
+        if (activeRowEl === node) activeRowEl = null;
+      },
+    };
   }
 
   /** @param {number} secs */
@@ -140,25 +169,23 @@
     return parts.join(' · ');
   }
 
-  /** @param {KeyboardEvent} e */
-  function handleKey(e) {
-    if (e.key === 'Escape') {
-      selectedItemId = null;
-    }
-  }
 </script>
 
-<svelte:window on:keydown={handleKey} />
-
 <div class="queue-view">
-  <div class="queue-pane" class:has-panel={!!selectedItem}>
+  <div class="queue-pane">
     <div class="queue-list">
       <header class="queue-header">
         <div class="queue-title">
           {#if allTerminal}
             Queue · ✓ All done · {doneCount} of {items.length}
           {:else}
-            Queue · {doneCount} of {items.length} complete
+            Queue · {doneCount} of {items.length} done
+            {#if isDownloadPhaseActive}
+              <span class="active-counter">· ↓ Batch {downloadBatchCurrent} of {downloadBatchTotal}</span>
+            {/if}
+            {#if transcribingIndex !== -1}
+              <span class="active-counter">· ✦ Transcribing {isDownloadPhaseActive ? `#${transcribingIndex + 1}` : `video ${transcribingIndex + 1} of ${items.length}`}</span>
+            {/if}
           {/if}
         </div>
         <div class="queue-actions">
@@ -190,20 +217,17 @@
       <div class="item-list" role="list">
         {#each items as item, i (item.id)}
           {@const isActive = item.status === 'starting' || item.status === 'downloading' || item.status === 'transcribing'}
+          {@const isDownloaded = item.status === 'downloaded'}
           {@const isDone = item.status === 'done'}
           {@const isFailed = item.status === 'failed'}
           {@const isCancelled = item.status === 'cancelled'}
-          {@const isSelected = selectedItemId === item.id}
+          <div class="queue-row-wrap">
           <div
             class="queue-row"
-            class:clickable={isDone}
-            class:selected={isSelected}
             class:active-row={isActive}
+            class:downloaded-row={isDownloaded}
             role="listitem"
-            on:click={() => isDone && selectItem(item)}
-            on:keydown={(e) => e.key === 'Enter' && isDone && selectItem(item)}
-            tabindex={isDone ? 0 : -1}
-            aria-selected={isDone ? isSelected : undefined}
+            use:bindActiveRow={isActive}
           >
             <span class="row-num">{i + 1}</span>
 
@@ -226,7 +250,7 @@
             </div>
 
             <div class="row-body">
-              <span class="row-title">{item.title}</span>
+              <span class="row-title" class:row-title-active={isActive}>{item.title}</span>
               {#if isFailed && item.error}
                 <span class="row-error-detail">{item.error}</span>
               {/if}
@@ -254,15 +278,11 @@
                     <span class="status-text downloading">⟳ Starting…</span>
                   </div>
                   <button
-                    class="cancel-active-btn"
-                    aria-label="Cancel"
-                    title="Cancel"
+                    class="skip-active-btn"
+                    aria-label="Skip to next video"
+                    title="Skip to next video"
                     on:click|stopPropagation={() => dispatch('cancelItem', { id: item.id })}
-                  >
-                    <svg width="11" height="11" viewBox="0 0 12 12" fill="none" aria-hidden="true">
-                      <path d="M2 2L10 10M10 2L2 10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
-                    </svg>
-                  </button>
+                  >Skip →</button>
                 </div>
               {:else if item.status === 'downloading'}
                 {#if true}
@@ -288,30 +308,56 @@
                       {/if}
                     </div>
                     <button
-                      class="cancel-active-btn"
-                      aria-label="Cancel download"
-                      title="Cancel download"
+                      class="skip-active-btn"
+                      aria-label="Skip to next video"
+                      title="Skip to next video"
                       on:click|stopPropagation={() => dispatch('cancelItem', { id: item.id })}
-                    >
-                      <svg width="11" height="11" viewBox="0 0 12 12" fill="none" aria-hidden="true">
-                        <path d="M2 2L10 10M10 2L2 10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
-                      </svg>
-                    </button>
+                    >Skip →</button>
                   </div>
                 {/if}
+              {:else if item.status === 'downloaded'}
+                <span class="status-text downloaded">✓ Downloaded · in queue</span>
+                <button
+                  class="cancel-item-btn"
+                  aria-label="Remove from queue"
+                  on:click|stopPropagation={() => dispatch('cancelItem', { id: item.id })}
+                  title="Remove from queue"
+                >
+                  <svg width="11" height="11" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+                    <path d="M2 2L10 10M10 2L2 10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+                  </svg>
+                </button>
               {:else if item.status === 'transcribing'}
+                {@const segs = item.streamSegments ?? []}
                 <div class="status-transcribing">
                   <div class="progress-bar">
                     <div class="progress-fill"></div>
                   </div>
-                  <span class="status-text transcribing">
-                    ✦ {item.streamSegments?.length ?? 0} segs
-                  </span>
+                  {#if segs.length > 0}
+                    <span class="status-text transcribing latest-seg">
+                      ✦ {segs[segs.length - 1].text?.slice(0, 55)}{(segs[segs.length - 1].text?.length ?? 0) > 55 ? '…' : ''}
+                    </span>
+                  {:else}
+                    <span class="status-text transcribing">✦ Transcribing…</span>
+                  {/if}
+                  <button
+                    class="skip-active-btn"
+                    aria-label="Skip to next video"
+                    title="Skip to next video"
+                    on:click|stopPropagation={() => dispatch('cancelItem', { id: item.id })}
+                  >Skip →</button>
                 </div>
               {:else if item.status === 'done'}
-                <span class="status-text done">
-                  ✓ Done · {item.wordCount ? `${(item.wordCount / 1000).toFixed(1)}k words` : ''}
-                </span>
+                <div class="status-done">
+                  <span class="status-text done">
+                    ✓ {item.wordCount ? `${(item.wordCount / 1000).toFixed(1)}k words` : 'Done'}
+                  </span>
+                  <button
+                    class="open-history-btn"
+                    on:click={() => dispatch('viewHistory', { item })}
+                    title="View transcript in History"
+                  >Open ↗</button>
+                </div>
               {:else if item.status === 'failed'}
                 <div class="status-failed">
                   <span class="status-text failed">✗ Error</span>
@@ -335,26 +381,17 @@
               {/if}
             </div>
           </div>
+          {#if item.id === activeItemId && activityEntries.length > 0}
+            <div class="item-log">
+              <ActivityLogPanel entries={activityEntries} handlers={activityHandlers} />
+            </div>
+          {/if}
+          </div>
         {/each}
       </div>
     {/if}
     </div>
-
-    <ActivityLogPanel entries={activityEntries} handlers={activityHandlers} />
   </div>
-
-  {#if selectedItem?.result}
-    <div class="transcript-panel-wrap" transition:fly={{ x: 300, duration: 200 }}>
-      <TranscriptPanel
-        result={selectedItem.result}
-        activeTab={activeTab}
-        defaultName={selectedItem.title}
-        {timestamps}
-        onTabChange={handleTabChange}
-        onCopy={handleCopy}
-      />
-    </div>
-  {/if}
 </div>
 
 <style>
@@ -373,12 +410,6 @@
     min-height: 0;
     /* Sit flush against the transcript panel on the right. */
   }
-  .queue-pane.has-panel {
-    /* Match the existing has-panel transition so the right pane animates
-       in cleanly without the left pane jumping. */
-    flex: 1;
-  }
-
   .queue-list {
     flex: 1;
     display: flex;
@@ -404,6 +435,11 @@
     font-size: 13px;
     font-weight: 600;
     color: var(--text);
+  }
+
+  .active-counter {
+    font-weight: 500;
+    color: var(--accent);
   }
 
   .queue-actions {
@@ -475,15 +511,18 @@
     align-items: center;
     gap: 10px;
     padding: 8px 14px;
-    border-bottom: 1px solid var(--glass-border-soft);
     transition: background 0.12s;
     position: relative;
   }
-  .queue-row:last-child { border-bottom: none; }
-  .queue-row.clickable { cursor: pointer; }
-  .queue-row.clickable:hover { background: var(--surface-2); }
-  .queue-row.selected { background: var(--surface-3); }
-  .queue-row.active-row { background: rgba(var(--accent), 0.04); }
+  .queue-row.active-row {
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+    border-left: 3px solid var(--accent);
+    padding-left: 11px; /* compensate for 3px border so content doesn't shift */
+  }
+  .queue-row.downloaded-row {
+    border-left: 3px solid color-mix(in srgb, #4ade80 40%, transparent);
+    padding-left: 11px; /* compensate for 3px border so content doesn't shift */
+  }
 
   .row-num {
     font-size: 11px;
@@ -529,6 +568,9 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .row-title-active {
+    font-weight: 600;
+  }
 
   .row-error-detail {
     font-size: 11px;
@@ -552,6 +594,7 @@
   }
   .status-text.waiting { color: var(--text-3); }
   .status-text.downloading { color: var(--text); font-variant-numeric: tabular-nums; }
+  .status-text.downloaded { color: #4ade80; font-size: 12px; font-weight: 500; }
   .status-text.transcribing { color: var(--text-2); font-size: 11px; }
   .status-text.done { color: #4ade80; }
   .status-text.failed { color: var(--error); }
@@ -573,7 +616,7 @@
   }
   .status-downloading .dl-bar { grid-area: bar; }
   .status-downloading .status-downloading-meta { grid-area: meta; }
-  .status-downloading .cancel-active-btn { grid-area: btn; }
+  .status-downloading .skip-active-btn { grid-area: btn; }
 
   .dl-bar {
     width: 100%;
@@ -640,7 +683,12 @@
     display: flex;
     flex-direction: column;
     align-items: flex-end;
-    gap: 3px;
+    gap: 4px;
+    width: 100%;
+  }
+  .status-transcribing .latest-seg,
+  .status-transcribing .status-text.transcribing:not(.latest-seg) {
+    max-width: 100%;
   }
   .progress-bar {
     width: 80px;
@@ -683,19 +731,21 @@
   }
   .status-downloading-meta .status-text { flex-shrink: 0; }
 
-  .cancel-active-btn {
-    background: none;
+  .skip-active-btn {
+    background: var(--surface-2);
     border: 1px solid var(--glass-border-soft);
-    color: var(--text-3);
-    padding: 3px;
+    color: var(--text-2);
+    padding: 2px 8px;
     border-radius: 4px;
+    font-family: inherit;
+    font-size: 11px;
+    font-weight: 500;
     cursor: pointer;
-    display: grid;
-    place-items: center;
     flex-shrink: 0;
+    white-space: nowrap;
     transition: color 0.12s, border-color 0.12s, background 0.12s;
   }
-  .cancel-active-btn:hover {
+  .skip-active-btn:hover {
     color: var(--error);
     border-color: var(--error-border, var(--glass-border-soft));
     background: var(--error-bg, var(--surface-2));
@@ -731,12 +781,52 @@
   .queue-row:hover .cancel-item-btn { opacity: 1; }
   .cancel-item-btn:hover { color: var(--error); }
 
-  /* ── Right panel ──────────────────────────────────────────── */
-  .transcript-panel-wrap {
-    width: 420px;
-    flex-shrink: 0;
+  /* ── Per-item wrapping shell (row + optional inline log) ─── */
+  .queue-row-wrap {
     display: flex;
-    margin-left: 14px;
-    min-height: 0;
+    flex-direction: column;
+  }
+  .queue-row-wrap:not(:last-child) .queue-row { border-bottom: 1px solid var(--glass-border-soft); }
+
+  /* ── Inline activity log per item ──────────────────────────── */
+  .item-log {
+    border-top: 1px solid var(--glass-border-soft);
+    border-bottom: 1px solid var(--glass-border-soft);
+    background: var(--surface-2);
+    padding: 8px 14px 12px;
+  }
+
+  /* ── Done row ────────────────────────────────────────────── */
+  .status-done {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .open-history-btn {
+    background: var(--surface-2);
+    border: 1px solid var(--glass-border-soft);
+    border-radius: 4px;
+    font-family: inherit;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--text-2);
+    padding: 2px 7px;
+    cursor: pointer;
+    transition: color 0.15s, background 0.15s;
+    white-space: nowrap;
+  }
+  .open-history-btn:hover {
+    color: var(--text);
+    background: var(--surface-3);
+  }
+
+  /* ── Latest segment text in transcribing row ──────────────── */
+  .latest-seg {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 200px;
+    display: block;
+    text-align: right;
   }
 </style>

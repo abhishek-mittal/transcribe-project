@@ -328,6 +328,12 @@
       resetProbe();
       return;
     }
+    // Flip to 'probing' immediately (not just once runProbe actually starts)
+    // so callers gating on probeState — e.g. the page-level "Transcribe"
+    // handler — can't slip through during the debounce window and enqueue
+    // the raw, unprobed URL as a fake single video before we know whether
+    // it's actually a playlist/channel.
+    probeState = 'probing';
     debounceTimer = setTimeout(() => {
       runProbe(newUrl);
     }, 800);
@@ -346,7 +352,7 @@
     loadingMore = true;
     loadMoreError = false;
     try {
-      const res = await invokeFn('probe_url_page', { url, page_start: pageStart, page_end: pageEnd });
+      const res = await invokeFn('probe_url_page', { url, pageStart, pageEnd });
       if (res.type === 'page' && Array.isArray(res.entries)) {
         const existing = listProbeResult.entries ?? [];
         const seen = new Set(existing.map((/** @type {any} */ e) => e.id));
@@ -469,6 +475,41 @@
             cacheAge={cacheAge}
             onRefresh={handleRefreshProbe}
           />
+        {/if}
+        {#if probeState === 'preview' && probeResult}
+          <div class="preview-card">
+            <div class="preview-thumb-wrap">
+              {#if probeResult.thumbnail}
+                <img
+                  class="preview-thumb"
+                  src={probeResult.thumbnail}
+                  alt=""
+                  on:error={(e) => {
+                    console.error('[preview-thumb] failed to load:', probeResult.thumbnail);
+                    e.currentTarget.style.display = 'none';
+                    e.currentTarget.nextElementSibling.style.display = 'grid';
+                  }}
+                  on:load={() => console.log('[preview-thumb] loaded ok:', probeResult.thumbnail)}
+                />
+              {/if}
+              <div class="preview-thumb-placeholder" style={probeResult.thumbnail ? 'display:none' : ''} aria-hidden="true">
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+                  <rect x="2" y="4" width="20" height="16" rx="2" stroke="currentColor" stroke-width="1.4"/>
+                  <path d="M10 9l5 3-5 3V9z" fill="currentColor"/>
+                </svg>
+              </div>
+            </div>
+            <div class="preview-meta">
+              <p class="preview-title">{probeResult.title || 'Video'}</p>
+              {#if probeResult.uploader || probeResult.duration}
+                <p class="preview-sub">
+                  {#if probeResult.uploader}{probeResult.uploader}{/if}
+                  {#if probeResult.uploader && probeResult.duration}<span class="dot-sep"> · </span>{/if}
+                  {#if probeResult.duration}{formatDuration(probeResult.duration)}{/if}
+                </p>
+              {/if}
+            </div>
+          </div>
         {/if}
       </div>
 

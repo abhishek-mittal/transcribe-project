@@ -1,0 +1,114 @@
+{
+  "meta": {
+    "project": "transcribe-project",
+    "platform": "copilot",
+    "generatedAt": "2026-05-29",
+    "version": "1.0.0",
+    "projectName": "transcribe-project"
+  },
+  "agents": [
+    {
+      "id": "developer",
+      "name": "Developer",
+      "role": "Full-Stack Developer",
+      "modelTier": "balanced",
+      "file": ".github/agents/developer.agent.md",
+      "matchCategories": [
+        "sprint",
+        "blocker"
+      ],
+      "matchKeywords": [
+        "build",
+        "implement",
+        "fix",
+        "feature",
+        "bug",
+        "create"
+      ],
+      "autoApprove": true
+    },
+    {
+      "id": "reviewer",
+      "name": "Reviewer",
+      "role": "Code Reviewer & Quality Gate",
+      "modelTier": "balanced",
+      "file": ".github/agents/reviewer.agent.md",
+      "matchCategories": [
+        "dod",
+        "review"
+      ],
+      "matchKeywords": [
+        "review",
+        "PR",
+        "pull request",
+        "security",
+        "test",
+        "merge"
+      ],
+      "autoApprove": false
+    },
+    {
+      "id": "architect",
+      "name": "Architect",
+      "role": "System Architect & Optimization Lead",
+      "modelTier": "balanced",
+      "file": ".github/agents/architect.agent.md",
+      "matchCategories": [
+        "design",
+        "optimization"
+      ],
+      "matchKeywords": [
+        "design",
+        "architecture",
+        "optimize",
+        "performance",
+        "trade-off"
+      ],
+      "autoApprove": false
+    },
+    {
+      "id": "director",
+      "name": "Director",
+      "role": "Routing & Orchestration",
+      "modelTier": "fast",
+      "file": ".github/agents/director.agent.md",
+      "matchCategories": [
+        "blocker",
+        "sprint",
+        "design",
+        "dod"
+      ],
+      "matchKeywords": [
+        "route",
+        "delegate",
+        "orchestrate"
+      ],
+      "autoApprove": true
+    }
+  ],
+  "rules": [
+    {
+      "id": "development-standards",
+      "name": "Development Standards",
+      "alwaysApply": true,
+      "file": ".github/copilot-instructions.md",
+      "section": "Development Standards"
+    }
+  ],
+  "skills": [],
+  "hooks": [
+    {
+      "id": "rna-updated-validate",
+      "event": "rna-updated",
+      "description": "Validate registry when RNA files change",
+      "activates": "validate-registry",
+      "type": "script",
+      "scriptPath": ".rna/validate-registry.js",
+      "directorApproval": false,
+      "enabled": true
+    }
+  ],
+  "routes": [],
+  "director": null,
+  "joiningPatterns": []
+}

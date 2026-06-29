@@ -40,6 +40,7 @@ from api.transcribe_core import (
     DEFAULT_MODEL,
     VALID_MODELS,
     _get_model,
+    _ig_cookies_file_path,
     _is_youtube_search_results_url,
     _search_query_from_url,
     download_audio,
@@ -55,7 +56,7 @@ SUPPORTED_MODELS_V1 = {"tiny", "base", "small"}
 MAX_URL_LENGTH = 2048
 HF_PROGRESS_INTERVAL_S = 0.5
 
-# yt-dlp error messages to classify as bot challenges.
+# yt-dlp error messages to classify as bot challenges (YouTube-specific).
 _BOT_CHALLENGE_PATTERNS = [
     re.compile(p, re.IGNORECASE)
     for p in (
@@ -64,6 +65,19 @@ _BOT_CHALLENGE_PATTERNS = [
         r"confirm you.re not a bot",
         r"not a bot",
         r"http error 429",
+    )
+]
+
+# Instagram login-wall errors — separate code so the UI can give a specific hint.
+_INSTAGRAM_AUTH_PATTERNS = [
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"instagram sent an empty media response",
+        r"instagram.*login",
+        r"login.*instagram",
+        r"you need to log in",
+        r"not logged in",
+        r"checkpoint required",
     )
 ]
 
@@ -111,6 +125,28 @@ class ValidationError(Exception):
         self.message = message
 
 
+def validate_model_and_timestamps(data: dict[str, Any]) -> tuple[str, bool]:
+    """Validate and return (model, use_timestamps). Raise ValidationError on failure.
+
+    Shared by `validate_request` (which additionally requires `url`) and
+    `--mode transcribe` (F13's file-only mode, which has no `url` at all —
+    it transcribes an already-downloaded file).
+    """
+    model = (data.get("model") or DEFAULT_MODEL).strip()
+    if model not in SUPPORTED_MODELS_V1:
+        raise ValidationError(
+            "INVALID_MODEL",
+            f"only {sorted(SUPPORTED_MODELS_V1)} models are supported; got '{model}'",
+        )
+    if model not in VALID_MODELS:
+        raise ValidationError(
+            "INVALID_MODEL", f"unknown model: {model}"
+        )
+
+    use_timestamps = bool(data.get("timestamps", True))
+    return model, use_timestamps
+
+
 def validate_request(data: dict[str, Any]) -> tuple[str, str, bool]:
     """Validate and return (url, model, use_timestamps). Raise ValidationError on failure."""
     url = (data.get("url") or "").strip()
@@ -125,31 +161,36 @@ def validate_request(data: dict[str, Any]) -> tuple[str, str, bool]:
             "INVALID_URL", "url must start with http:// or https://"
         )
 
-    model = (data.get("model") or DEFAULT_MODEL).strip()
-    if model not in SUPPORTED_MODELS_V1:
-        raise ValidationError(
-            "INVALID_MODEL",
-            f"only {sorted(SUPPORTED_MODELS_V1)} models are supported; got '{model}'",
-        )
-    if model not in VALID_MODELS:
-        raise ValidationError(
-            "INVALID_MODEL", f"unknown model: {model}"
-        )
-
-    use_timestamps = bool(data.get("timestamps", True))
+    model, use_timestamps = validate_model_and_timestamps(data)
     return url, model, use_timestamps
 
 
 # ---------------------------------------------------------------------------
 # FFmpeg detection
 # ---------------------------------------------------------------------------
-def check_ffmpeg() -> None:
-    if shutil.which("ffmpeg") is None:
+def resolve_ffmpeg() -> str:
+    """Resolve the ffmpeg binary to use, bundled-first.
+
+    When frozen (PyInstaller build shipped in the app bundle), ffmpeg is
+    bundled by `scripts/fetch_ffmpeg.py` next to the sidecar executable
+    itself — use that unconditionally so the app works without requiring
+    `brew install ffmpeg` on the host. When not frozen (dev mode via
+    `python -m api.sidecar` or the Flask `dev:api` path), fall back to
+    `PATH` exactly as before.
+    """
+    if getattr(sys, "frozen", False):
+        bundled = os.path.join(os.path.dirname(sys.executable), "ffmpeg")
+        if os.path.exists(bundled):
+            return bundled
+
+    path_ffmpeg = shutil.which("ffmpeg")
+    if path_ffmpeg is None:
         raise ValidationError(
             "FFMPEG_MISSING",
             "FFmpeg is required. Install with `brew install ffmpeg` (macOS) or "
             "see https://ffmpeg.org/download.html",
         )
+    return path_ffmpeg
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +278,9 @@ def ensure_model_downloaded(model_size: str) -> None:
 # ---------------------------------------------------------------------------
 def classify_ydl_error(exc: Exception) -> str:
     msg = str(exc)
+    for pat in _INSTAGRAM_AUTH_PATTERNS:
+        if pat.search(msg):
+            return "INSTAGRAM_LOGIN_REQUIRED"
     for pat in _BOT_CHALLENGE_PATTERNS:
         if pat.search(msg):
             return "BOT_CHALLENGE"
@@ -295,7 +339,7 @@ _signal_state: dict[str, Any] = {}
 # ---------------------------------------------------------------------------
 def run_transcription(url: str, model_size: str, use_timestamps: bool) -> None:
     """Run the full download + transcribe flow, emitting events to stdout."""
-    check_ffmpeg()
+    ffmpeg_path = resolve_ffmpeg()
     ensure_model_downloaded(model_size)
 
     tmp_dir = tempfile.mkdtemp()
@@ -318,6 +362,7 @@ def run_transcription(url: str, model_size: str, use_timestamps: bool) -> None:
             tmp_dir,
             desktop_mode=True,
             progress_callback=_on_download_progress,
+            ffmpeg_location=ffmpeg_path,
         )
 
         # Final 100% tick — yt-dlp's hook fires for the merged file but
@@ -338,6 +383,78 @@ def run_transcription(url: str, model_size: str, use_timestamps: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
+# F13: pipeline queue — download-only and transcribe-only modes
+#
+# Every event emitted by these two functions carries `item_id` so the Rust
+# layer (and the frontend behind it) can route concurrent download events
+# to the correct queue row — up to 5 `--mode download` sidecars run at once.
+# ---------------------------------------------------------------------------
+def run_download(url: str, out_dir: str, item_id: str) -> None:
+    """Download audio only (no transcription) into the persistent
+    `downloads/<job_id>/` directory the Rust layer created via `start_job`.
+
+    Unlike `run_transcription`'s tempdir (deleted unconditionally in its
+    `finally`), `out_dir` here is NOT cleaned up by this function — the
+    file must survive until the separate `--mode transcribe` step (or
+    until `cancel_download`/`finalize_job` clean it up on the Rust side).
+    """
+    ffmpeg_path = resolve_ffmpeg()
+    os.makedirs(out_dir, exist_ok=True)
+
+    def _on_download_progress(p: dict) -> None:
+        emit_phase(
+            "downloading-audio",
+            item_id=item_id,
+            percent=p.get("percent"),
+            downloaded_bytes=p.get("downloaded_bytes"),
+            total_bytes=p.get("total_bytes"),
+            speed_bps=p.get("speed_bps"),
+            eta_secs=p.get("eta_secs"),
+        )
+
+    emit_phase("downloading", item_id=item_id)
+    audio_path = download_audio(
+        url,
+        out_dir,
+        desktop_mode=True,
+        progress_callback=_on_download_progress,
+        ffmpeg_location=ffmpeg_path,
+    )
+    emit_phase("downloading-audio", item_id=item_id, percent=100.0)
+
+    if _cancel_requested.is_set():
+        raise Cancelled()
+
+    emit({"event": "download-done", "item_id": item_id, "path": audio_path})
+
+
+def run_transcribe_file(audio_path: str, item_id: str, model_size: str, use_timestamps: bool) -> None:
+    """Transcribe an already-downloaded audio file (no yt-dlp involved).
+
+    On success, deletes `audio_path` — the file's only purpose was getting
+    to this point. On failure, the file is left in place so a retry can
+    skip straight back to transcription instead of re-downloading.
+    """
+    resolve_ffmpeg()
+    ensure_model_downloaded(model_size)
+
+    emit_phase("transcribing", item_id=item_id)
+    result = transcribe_audio(audio_path, model_size, use_timestamps)
+
+    if _cancel_requested.is_set():
+        raise Cancelled()
+
+    emit({"event": "result", "item_id": item_id, **result})
+
+    try:
+        os.unlink(audio_path)
+    except OSError as e:
+        # Non-fatal: a stray leftover file is cleaned up later by
+        # finalize_job's downloads/<job_id>/ directory removal anyway.
+        print(f"run_transcribe_file: failed to delete {audio_path}: {e}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 # Default cap on search-results entries. Matches YouTube's own ~20-per-page
@@ -352,6 +469,34 @@ SEARCH_RESULTS_MAX = 30
 # thumbnail fetch, but tight enough that a stuck connection doesn't
 # multiply across 20 entries.
 SEARCH_SOCKET_TIMEOUT = 15
+# Initial page size for the FIRST probe of a playlist/channel (F14). We
+# used to send PLAYLIST_PAGE_SIZE (20) here, which forced yt-dlp to walk
+# the full playlist index before returning anything. For a YouTube
+# channel tab like `@MillieAdrian/shorts` that walk can take 5–10s
+# with zero UI feedback. Streaming the first 5 entries as they resolve
+# (via the process_info callback below) gives the user something to look
+# at in ~1s; the remaining entries are paged in via probe_url_page when
+# they hit "Load more".
+INITIAL_PAGE_SIZE = 5
+# Subsequent "Load more" pages and the standalone probe_url_page still use
+# this larger page size — 20 matches YouTube's per-page count and amortises
+# the round-trip cost across more rows.
+PLAYLIST_PAGE_SIZE = 20
+
+
+def _thumbnail_for_entry(entry: dict[str, Any]) -> str:
+    """Return a thumbnail URL for a yt-dlp playlist entry.
+
+    flat-extract entries often have no thumbnail; build a YouTube default
+    thumbnail URL from the video ID when available.
+    """
+    thumb = entry.get("thumbnail") or ""
+    if thumb:
+        return thumb
+    vid_id = entry.get("id") or ""
+    if len(vid_id) == 11 and re.match(r'^[A-Za-z0-9_-]+$', vid_id):
+        return f"https://i.ytimg.com/vi/{vid_id}/mqdefault.jpg"
+    return ""
 
 
 def _normalise_entries(raw_entries: list[Any]) -> list[dict[str, Any]]:
@@ -372,11 +517,65 @@ def _normalise_entries(raw_entries: list[Any]) -> list[dict[str, Any]]:
         out.append({
             "id": entry.get("id") or "",
             "title": entry.get("title") or entry.get("id") or "Untitled",
-            "thumbnail": entry.get("thumbnail") or "",
+            "thumbnail": _thumbnail_for_entry(entry),
             "duration": int(entry.get("duration") or 0),
             "url": entry_url,
         })
     return out
+
+
+def _probe_ig_oembed(url: str) -> dict[str, Any]:
+    """Probe an Instagram URL via the public oEmbed API (no auth required).
+
+    yt-dlp's Instagram extractor uses a GraphQL doc_id that Instagram retired
+    for anonymous access (returns ``execution error`` + ``data: null``), so we
+    bypass it entirely for the probe step.  oEmbed works for any public post,
+    reel, or IGTV without session cookies.  Duration is not available from
+    oEmbed — the frontend handles 0 as "unknown".
+    """
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    oembed_url = (
+        "https://www.instagram.com/api/v1/oembed/"
+        f"?url={urllib.parse.quote(url, safe='')}&hidecaption=0&maxwidth=658"
+    )
+    req = urllib.request.Request(
+        oembed_url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return {"type": "error", "code": "INVALID_URL", "message": "Instagram post not found"}
+        if exc.code in (401, 403):
+            return {
+                "type": "error",
+                "code": "INSTAGRAM_LOGIN_REQUIRED",
+                "message": f"Instagram returned {exc.code}",
+            }
+        return {"type": "error", "code": "NETWORK_ERROR", "message": str(exc)}
+    except Exception as exc:
+        return {"type": "error", "code": "NETWORK_ERROR", "message": str(exc)}
+
+    return {
+        "type": "video",
+        "url": url,
+        "title": data.get("title") or data.get("author_name") or "Instagram Video",
+        "thumbnail": data.get("thumbnail_url") or "",
+        "duration": 0,
+        "uploader": data.get("author_name") or "",
+    }
 
 
 def probe_url(url: str) -> dict[str, Any]:
@@ -417,7 +616,7 @@ def probe_url(url: str) -> dict[str, Any]:
         }
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(synthetic_url, download=False, process=False)
+                info = ydl.extract_info(synthetic_url, download=False, process=True)
         except Exception as exc:
             code = classify_ydl_error(exc)
             return {"type": "error", "code": code, "message": str(exc)}
@@ -434,7 +633,7 @@ def probe_url(url: str) -> dict[str, Any]:
         # search results with the same VideoPicker component. Note that
         # thumbnails come back empty under extract_flat=in_playlist — the
         # picker renders a placeholder when this happens.
-        raw_entries = info.get("entries") or []
+        raw_entries = list(info.get("entries") or [])
         entries = _normalise_entries(raw_entries)
         return {
             "type": "search",
@@ -443,7 +642,48 @@ def probe_url(url: str) -> dict[str, Any]:
             "url": url,
             "count": len(entries),
             "entries": entries,
+            # Search results are fetched exactly to `n` with no further
+            # pages available, so total is just what we got — no Load More.
+            "total_count": len(entries),
         }
+
+    from api.transcribe_core import _is_instagram_url, _is_instagram_profile_url
+
+    # Instagram: bypass yt-dlp's GraphQL path (doc_id retired for anonymous
+    # access since 2024) and use the public oEmbed API instead.
+    if _is_instagram_url(url):
+        if _is_instagram_profile_url(url):
+            return {
+                "type": "error",
+                "code": "IG_PROFILE_UNSUPPORTED",
+                "message": "Instagram profile pages aren't supported. Paste an individual reel URL — e.g. instagram.com/reel/ABC123",
+            }
+        return _probe_ig_oembed(url)
+
+    # F14 progressive picker: emit one `entry` event per resolved entry so
+    # the UI can render rows as yt-dlp finds them, instead of waiting for
+    # the whole playlistend walk to finish before returning the list.
+    # We cap the first probe at INITIAL_PAGE_SIZE (5) — the rest come via
+    # probe_url_page when the user clicks "Load more".
+    emitted_entry_ids: set[str] = set()
+
+    def _process_entry(entry: dict) -> None:
+        """yt-dlp per-entry callback (F14). Fires once per entry as
+        yt-dlp resolves it, well before extract_info returns. We
+        normalize + dedupe + emit so the frontend can stream rows in."""
+        if entry is None:
+            return
+        eid = entry.get("id") or ""
+        if eid and eid in emitted_entry_ids:
+            return  # yt-dlp can fire twice for some extractors
+        if eid:
+            emitted_entry_ids.add(eid)
+        emit({"event": "entry", "entry": _normalise_entry(entry)})
+
+    # Tiny status heartbeat so the UI can show "fetching…" before the
+    # first entry resolves (yt-dlp is silent for the first ~1–2s of a
+    # channel walk while it's resolving the playlist index itself).
+    emit({"event": "status", "message": "Resolving channel index…"})
 
     ydl_opts = {
         "quiet": True,
@@ -451,22 +691,33 @@ def probe_url(url: str) -> dict[str, Any]:
         "skip_download": True,
         "extract_flat": "in_playlist",
         "socket_timeout": 8,
+        "playlistend": INITIAL_PAGE_SIZE,
+        "process_info": _process_entry,
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False, process=False)
+            info = ydl.extract_info(url, download=False, process=True)
     except Exception as exc:
         code = classify_ydl_error(exc)
+        # Also stream an `error` event so the UI's activity strip can show
+        # it without waiting for the final result line.
+        emit({"event": "error", "code": code, "message": str(exc)})
         return {"type": "error", "code": code, "message": str(exc)}
 
     if info is None:
+        emit({"event": "error", "code": "INVALID_URL", "message": "no metadata returned"})
         return {"type": "error", "code": "INVALID_URL", "message": "no metadata returned"}
 
     is_playlist = info.get("_type") == "playlist" or "entries" in info
 
     if is_playlist:
-        entries = _normalise_entries(info.get("entries") or [])
+        entries = _normalise_entries(list(info.get("entries") or []))
+        total_count = info.get("playlist_count")
+        # F14: emit a `done` event with the totals so the UI knows the
+        # initial probe finished and can show "5 of N videos · streaming
+        # more in background" before the user clicks Load more.
+        emit({"event": "done", "type": "playlist", "count": len(entries), "total_count": total_count})
         return {
             "type": "playlist",
             "kind": "playlist",
@@ -475,6 +726,10 @@ def probe_url(url: str) -> dict[str, Any]:
             "uploader": info.get("uploader") or info.get("channel") or "",
             "count": len(entries),
             "entries": entries,
+            # yt-dlp populates this on the root playlist object under
+            # extract_flat=in_playlist at no extra network cost. None when
+            # the source doesn't expose a count (e.g. some channel tabs).
+            "total_count": total_count,
         }
     else:
         thumbnail = info.get("thumbnail") or ""
@@ -482,6 +737,9 @@ def probe_url(url: str) -> dict[str, Any]:
         if thumbnails:
             best = max(thumbnails, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0))
             thumbnail = best.get("url") or thumbnail
+        # F14: also signal done for single-video probes so the UI can
+        # flip out of "probing" state promptly.
+        emit({"event": "done", "type": "video"})
         return {
             "type": "video",
             "url": info.get("webpage_url") or url,
@@ -490,6 +748,46 @@ def probe_url(url: str) -> dict[str, Any]:
             "duration": int(info.get("duration") or 0),
             "uploader": info.get("uploader") or info.get("channel") or "",
         }
+
+
+def probe_url_page(url: str, page_start: int, page_end: int) -> dict[str, Any]:
+    """Fetch one additional page of playlist/channel entries for "Load more".
+
+    `page_start`/`page_end` are 1-indexed and passed straight through to
+    yt-dlp's `playliststart`/`playlistend` (matching yt-dlp's own
+    convention, same as the initial probe's `playlistend`). Only the new
+    page's entries are returned — the frontend appends them to the list it
+    already has, so this never re-fetches or re-sends earlier pages.
+    """
+    if page_start < 1 or page_end < page_start:
+        return {"type": "error", "code": "INVALID_URL", "message": "invalid page range"}
+
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "extract_flat": "in_playlist",
+        "socket_timeout": 8,
+        "playliststart": page_start,
+        "playlistend": page_end,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False, process=True)
+    except Exception as exc:
+        code = classify_ydl_error(exc)
+        return {"type": "error", "code": code, "message": str(exc)}
+
+    if info is None:
+        return {"type": "error", "code": "INVALID_URL", "message": "no metadata returned"}
+
+    entries = _normalise_entries(list(info.get("entries") or []))
+    return {
+        "type": "page",
+        "entries": entries,
+        "total_count": info.get("playlist_count"),
+    }
 
 
 def parse_args() -> dict[str, Any]:
@@ -511,6 +809,16 @@ def parse_args() -> dict[str, Any]:
                 out["timestamps"] = v.lower() in ("true", "1", "yes")
             elif k == "--mode":
                 out["mode"] = v
+            elif k == "--page-start":
+                out["page_start"] = int(v)
+            elif k == "--page-end":
+                out["page_end"] = int(v)
+            elif k == "--out-dir":
+                out["out_dir"] = v
+            elif k == "--item-id":
+                out["item_id"] = v
+            elif k == "--audio-path":
+                out["audio_path"] = v
             i += 2
         return out
     # Stdin mode (legacy/dev).
@@ -530,7 +838,11 @@ def main() -> int:
         emit_error("INTERNAL", f"failed to read request: {e}")
         return 2
 
-    mode = data.get("mode", "transcribe")
+    # No --mode flag at all (the legacy run_sidecar single-video path,
+    # which never sets one) defaults to the full download+transcribe flow —
+    # named "transcribe-full" per F13 to free up the bare "transcribe" mode
+    # name for the new file-only mode below.
+    mode = data.get("mode", "transcribe-full")
 
     if mode == "probe":
         url = (data.get("url") or "").strip()
@@ -538,11 +850,71 @@ def main() -> int:
             sys.stdout.write(json.dumps({"type": "error", "code": "INVALID_URL", "message": "url is required and must start with http(s)://"}) + "\n")
             sys.stdout.flush()
             return 2
-        result = probe_url(url)
+        page_start = data.get("page_start")
+        page_end = data.get("page_end")
+        if page_start is not None and page_end is not None:
+            result = probe_url_page(url, page_start, page_end)
+        else:
+            result = probe_url(url)
         sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
         sys.stdout.flush()
         return 0
 
+    if mode == "download":
+        url = (data.get("url") or "").strip()
+        out_dir = (data.get("out_dir") or "").strip()
+        item_id = (data.get("item_id") or "").strip()
+        if not url or not url.startswith(("http://", "https://")):
+            emit_error("INVALID_URL", "url is required and must start with http(s)://")
+            return 2
+        if not out_dir or not item_id:
+            emit_error("INVALID_URL", "out_dir and item_id are required for --mode download")
+            return 2
+        try:
+            run_download(url, out_dir, item_id)
+        except Cancelled:
+            return 130
+        except Exception as e:
+            code = classify_ydl_error(e)
+            message = str(e)
+            if code == "INSTAGRAM_LOGIN_REQUIRED":
+                cookies_path = _ig_cookies_file_path()
+                message = (
+                    "Instagram requires login to download this video. "
+                    "Open Instagram in Safari and log in, then try again. "
+                    f"Or place a cookies.txt file at: {cookies_path}"
+                )
+            emit({"event": "error", "item_id": item_id, "code": code, "message": message})
+            print(f"sidecar[download item={item_id}]: {code}: {e}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+            return 1
+        return 0
+
+    if mode == "transcribe":
+        audio_path = (data.get("audio_path") or "").strip()
+        item_id = (data.get("item_id") or "").strip()
+        if not audio_path or not item_id:
+            emit_error("INVALID_URL", "audio_path and item_id are required for --mode transcribe")
+            return 2
+        try:
+            model_size, use_timestamps = validate_model_and_timestamps(data)
+        except ValidationError as e:
+            emit({"event": "error", "item_id": item_id, "code": e.code, "message": e.message})
+            return 2
+        try:
+            run_transcribe_file(audio_path, item_id, model_size, use_timestamps)
+        except Cancelled:
+            return 130
+        except Exception as e:
+            code = classify_ydl_error(e)
+            emit({"event": "error", "item_id": item_id, "code": code, "message": str(e)})
+            print(f"sidecar[transcribe item={item_id}]: {code}: {e}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+            return 1
+        return 0
+
+    # mode == "transcribe-full": existing single-video download+transcribe
+    # flow, unchanged.
     try:
         url, model_size, use_timestamps = validate_request(data)
     except ValidationError as e:
@@ -560,7 +932,16 @@ def main() -> int:
         return 130
     except Exception as e:
         code = classify_ydl_error(e)
-        emit_error(code, str(e))
+        if code == "INSTAGRAM_LOGIN_REQUIRED":
+            cookies_path = _ig_cookies_file_path()
+            message = (
+                "Instagram requires login to download this video. "
+                "Open Instagram in Safari and log in, then try again. "
+                f"Or place a cookies.txt file at: {cookies_path}"
+            )
+        else:
+            message = str(e)
+        emit_error(code, message)
         # Also log to stderr for debugging (visible in `tauri dev`).
         print(f"sidecar: {code}: {e}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)

@@ -57,11 +57,11 @@
 
   // ── Queue / batch job state ──────────────────────────────
   /**
-   * Single batch job. `items` are processed sequentially — one sidecar
-   * spawn at a time, results streamed back via `transcribe-progress`
-   * events. Status transitions: waiting → downloading → transcribing → done
-   * (or failed / cancelled). Download progress fields are optional and
-   * populated incrementally as yt-dlp reports each progress tick.
+   * Single batch job. F13 pipeline: up to 5 downloads run concurrently,
+   * feeding a single transcription slot one item at a time. Status
+   * transitions: waiting → downloading → downloaded → transcribing → done
+   * (or failed / cancelled at any point). Download progress fields are
+   * optional and populated incrementally as yt-dlp reports each tick.
    * @type {{
    *   id: string,
    *   model: string,
@@ -73,13 +73,15 @@
    *     title: string,
    *     thumbnail: string,
    *     duration: number,
-   *     status: 'waiting' | 'starting' | 'downloading' | 'transcribing' | 'done' | 'failed' | 'cancelled',
+   *     status: 'waiting' | 'starting' | 'downloading' | 'downloaded' | 'transcribing' | 'done' | 'failed' | 'cancelled',
    *     error: string | null,
    *     errorCode: string | null,
    *     result: { language: string, plain: string, timestamped: string | null, srt: string } | null,
    *     startedAt: string | null,
    *     completedAt: string | null,
    *     wordCount: number | null,
+   *     audioDuration?: number,
+   *     downloadPath: string | null,
    *     downloadPercent: number | null,
    *     downloadedBytes: number | null,
    *     totalBytes: number | null,
@@ -110,6 +112,8 @@
         return 'Network error. Check your connection and try again.';
       case 'BOT_CHALLENGE':
         return 'YouTube is blocking this video. Try a different one or open it in your browser first.';
+      case 'INSTAGRAM_LOGIN_REQUIRED':
+        return 'Instagram requires cookies to access this content. Sign into Instagram in Chrome or Safari, then retry. For reliable access, see Settings → Instagram for setup instructions.';
       case 'UNSUPPORTED_PLATFORM':
         return 'This URL is not supported. Try a YouTube, Instagram, or TikTok link.';
       case 'FFMPEG_MISSING':
@@ -169,7 +173,123 @@
     } catch (e) {
       console.warn('load_jobs failed:', e);
     }
+
+    try {
+      const activeJob = await invokeFn('load_active_job');
+      if (activeJob) {
+        const resumable = activeJob.items.filter((/** @type {any} */ i) =>
+          ['waiting', 'downloading', 'downloaded'].includes(i.phase)
+        ).length;
+        if (resumable > 0) {
+          resumeBannerJob = activeJob;
+        } else {
+          // Every item already reached a terminal phase (done/failed/
+          // cancelled) — the job was interrupted after all processing
+          // finished, just needed its completed_at/is_active stamped.
+          await invokeFn('finalize_job', {
+            jobId: activeJob.id,
+            stats: computeActiveJobStats(activeJob),
+          });
+        }
+      }
+    } catch (e) {
+      console.warn('load_active_job failed:', e);
+    }
+
+    // Sweep downloads/<job_id>/ directories with no matching is_active job
+    // — leftovers from a crash that happened before finalize_job's own
+    // cleanup could run. Safe to call after load_active_job has already
+    // decided whether to show the resume banner: a still-active job's
+    // directory is never touched.
+    try {
+      await invokeFn('cleanup_orphan_downloads');
+    } catch (e) {
+      console.warn('cleanup_orphan_downloads failed:', e);
+    }
   });
+
+  /**
+   * Compute finalize_job stats from an ActiveJobRecord's current item
+   * phases — used both by the "everything already terminal" auto-finalize
+   * path above and by the Discard handler below.
+   * @param {any} activeJob
+   */
+  function computeActiveJobStats(activeJob) {
+    const start = new Date(activeJob.created_at).getTime();
+    return {
+      elapsed_ms: Date.now() - start,
+      success_count: activeJob.items.filter((/** @type {any} */ i) => i.phase === 'done').length,
+      failure_count: activeJob.items.filter((/** @type {any} */ i) => i.phase === 'failed').length,
+      cancelled_count: activeJob.items.filter((/** @type {any} */ i) => i.phase === 'cancelled' || ['waiting', 'downloading', 'downloaded', 'transcribing'].includes(i.phase)).length,
+      total_words: activeJob.items.reduce((/** @type {number} */ s, /** @type {any} */ i) => s + (i.word_count || 0), 0),
+      total_audio_secs: 0,
+    };
+  }
+
+  /**
+   * Set when `load_active_job` finds an interrupted job with resumable
+   * items on startup. Drives the inline resume banner (below the sidebar
+   * nav, not a modal — see F13 spec).
+   * @type {any | null}
+   */
+  let resumeBannerJob = null;
+
+  /** Restore `currentJob` from the DB-backed ActiveJobRecord and resume the pipeline. */
+  function handleResumeJob() {
+    if (!resumeBannerJob) return;
+    const activeJob = resumeBannerJob;
+    resumeBannerJob = null;
+    currentJob = {
+      id: activeJob.id,
+      model: activeJob.model,
+      timestamps: activeJob.timestamps,
+      createdAt: activeJob.created_at,
+      items: activeJob.items.map((/** @type {any} */ item) => ({
+        id: item.id,
+        url: item.url,
+        title: item.title,
+        thumbnail: item.thumbnail,
+        duration: item.duration_secs || 0,
+        // 'starting' has no DB-persisted equivalent (it's a UI-only phase
+        // before the sidecar's first event) — collapse it to 'waiting' so
+        // resume re-downloads from scratch rather than getting stuck.
+        status: item.phase === 'starting' ? 'waiting' : item.phase,
+        error: item.error_message || null,
+        errorCode: item.error_code || null,
+        result: item.plain != null
+          ? { language: item.language, plain: item.plain, timestamped: item.timestamped, srt: item.srt }
+          : null,
+        startedAt: item.started_at || null,
+        completedAt: item.completed_at || null,
+        wordCount: item.word_count || null,
+        downloadPath: item.download_path || null,
+        downloadPercent: null,
+        downloadedBytes: null,
+        totalBytes: null,
+        speedBps: null,
+        etaSecs: null,
+        streamSegments: [],
+      })),
+    };
+    queueActive = true;
+    activeView = 'queue';
+    runPipelineJob(true);
+  }
+
+  /** Discard the interrupted job: cancel everything pending and clean up its downloads. */
+  async function handleDiscardJob() {
+    if (!resumeBannerJob || !invokeFn) return;
+    const activeJob = resumeBannerJob;
+    resumeBannerJob = null;
+    try {
+      await invokeFn('finalize_job', {
+        jobId: activeJob.id,
+        stats: computeActiveJobStats(activeJob),
+      });
+    } catch (e) {
+      console.warn('discard resume job: finalize_job failed:', e);
+    }
+  }
 
   /**
    * Persist the given partial settings (merged with current in-memory
@@ -207,8 +327,19 @@
     return errorMessageFor(code, fallback);
   }
 
+  /** @type {(() => void) | null} */
   let queueUnlisten = null;
   let queueCurrentItemId = null;
+  /**
+   * Set by "Cancel job" (top right). Checked by the download runner's chunk
+   * loop before starting each chunk so not-yet-started `waiting` items
+   * never get a sidecar spawned for them after the user cancelled — the
+   * runner's event listeners alone can't see `cancelQueueJob`'s direct
+   * mutation of `currentJob.items` for items that have no sidecar running
+   * yet to fire a 'terminated' event. Reset at the start of every
+   * runPipelineJob call.
+   */
+  let jobCancelRequested = false;
 
   // ── Activity log (drives the live event panel under the queue list) ────────
   /**
@@ -371,164 +502,357 @@
     return `${(kbps / 1024).toFixed(1)} MB/s`;
   }
 
-  async function runQueueLoop() {
-    if (!currentJob) return;
+  /**
+   * F13 pipeline queue runner. Replaces the old strictly-sequential
+   * `runQueueLoop` (one `run_sidecar` at a time = no overlap between
+   * network-bound downloads and CPU-bound transcription).
+   *
+   * Two concurrent, event-driven loops:
+   *   - Download runner: chunks of `DOWNLOAD_CHUNK_SIZE`, all spawned at
+   *     once per chunk; advances to the next chunk only once every item in
+   *     the current chunk reaches a terminal download outcome
+   *     (downloaded/failed/cancelled).
+   *   - Transcription runner: a FIFO queue fed by the download runner as
+   *     each item finishes downloading; drains one item at a time via the
+   *     single-flight `RunningSidecar` slot on the Rust side.
+   *
+   * `resume` (used by the resume-on-crash banner) skips items already
+   * `done`/`failed`/`cancelled`, re-downloads items still `waiting` or
+   * stuck mid-`downloading` (their partial files were never confirmed
+   * complete), and pushes already-`downloaded` items straight into the
+   * transcription queue without re-downloading.
+   */
+  const DOWNLOAD_CHUNK_SIZE = 5;
 
-    // Subscribe to sidecar events ONCE for the whole job, not per-item.
-    // Per-item subscription raced with the invoke response: Tauri's IPC
-    // channel can deliver the `terminated` event AFTER `await invokeFn(
-    // 'run_sidecar')` resolves, and the next loop iteration would
-    // unsubscribe before that late event drained. The listener now lives
-    // for the full job lifetime and routes events to the current item.
-    let currentItemIndex = -1;
-    if (listenFn) {
-      if (queueUnlisten) { try { queueUnlisten(); } catch {} }
+  async function runPipelineJob(resume = false) {
+    if (!currentJob || !invokeFn) return;
+    jobCancelRequested = false;
+    // Capture as a const: the function bodies below are closures that
+    // outlive this call (event listeners, .then/.catch callbacks), so
+    // TypeScript can't carry the `!currentJob` narrowing into them against
+    // the reactive `let currentJob`. `job` is the type-narrowed read handle;
+    // `currentJob = {...currentJob}` (unchanged) is still how reactivity
+    // is triggered after mutating `job.items` in place (same array/object).
+    const job = currentJob;
+    const jobInvoke = invokeFn;
+
+    if (!resume) {
       try {
-        queueUnlisten = await listenFn('transcribe-progress', (event) => {
-          if (currentItemIndex < 0) return;
-          handleQueueItemEvent(event.payload, currentItemIndex);
-          logActivity(event.payload);
+        await jobInvoke('start_job', {
+          job: {
+            id: job.id,
+            model: job.model,
+            timestamps: job.timestamps,
+            created_at: job.createdAt,
+            total_items: job.items.length,
+            items: job.items.map((item) => ({
+              id: item.id,
+              url: item.url,
+              title: item.title,
+              thumbnail: item.thumbnail,
+              duration_secs: item.duration || 0,
+              // Rust's create_job_active always inserts phase='waiting'
+              // regardless of what's sent — this is just to satisfy
+              // ActiveJobItemRecord's required (non-Optional) `phase` field
+              // during deserialization.
+              phase: 'waiting',
+            })),
+          },
         });
       } catch (e) {
-        console.warn('queue: failed to subscribe to events:', e);
+        console.warn('pipeline: start_job failed:', e);
       }
     }
 
-    try {
-      for (let i = 0; i < currentJob.items.length; i++) {
-        const item = currentJob.items[i];
-        if (item.status !== 'waiting') continue;
+    /** @type {Map<string, number>} item id -> index in job.items, for O(1) event routing while up to 5 downloads run concurrently. */
+    const indexById = new Map(job.items.map((item, i) => [item.id, i]));
+    /** @type {string[]} FIFO of item ids waiting for the single transcription slot. */
+    const transcribeQueue = [];
+    /** @type {string | null} */
+    let transcribeActive = null;
+    /** Resolved when the download runner has exhausted all chunks. */
+    let downloadRunnerDone = false;
 
-        // Mark as downloading
-        currentJob.items[i] = { ...item, status: 'downloading', startedAt: new Date().toISOString(), streamSegments: [] };
-        currentJob = { ...currentJob };
-        queueCurrentItemId = item.id;
-        currentItemIndex = i;
-
-        try {
-          if (invokeFn) {
-            await invokeFn('run_sidecar', { url: item.url, model: currentJob.model, timestamps: currentJob.timestamps });
-          }
-        } catch (e) {
-          currentJob.items[i] = {
-            ...currentJob.items[i],
-            status: 'failed',
-            error: queueErrorMessage(null, String(e)),
-            completedAt: new Date().toISOString(),
-          };
-          currentJob = { ...currentJob };
-        }
-        currentItemIndex = -1;
-      }
-    } finally {
-      // Tear the listener down only when the job is done, so any events
-      // that arrive between the last invoke resolving and this point still
-      // reach the UI.
-      if (queueUnlisten) { try { queueUnlisten(); queueUnlisten = null; } catch {} }
+    /** @param {string} itemId @param {Record<string, any>} patch */
+    function patchItem(itemId, patch) {
+      const idx = indexById.get(itemId);
+      if (idx === undefined) return;
+      job.items[idx] = { ...job.items[idx], ...patch };
+      currentJob = { ...job };
     }
 
-    queueCurrentItemId = null;
-    queueActive = false;
-    currentJob = { ...currentJob };
-    await finalizeJob();
-  }
+    /** @param {string} itemId */
+    function getItem(itemId) {
+      const idx = indexById.get(itemId);
+      return idx === undefined ? null : job.items[idx];
+    }
 
-  /** @param {any} payload @param {number} itemIndex */
-  function handleQueueItemEvent(payload, itemIndex) {
-    if (!currentJob || !payload || typeof payload !== 'object') return;
-    const item = currentJob.items[itemIndex];
-    if (!item) return;
-    const event = payload.event;
+    function startNextTranscription() {
+      if (transcribeQueue.length === 0 || jobCancelRequested) {
+        transcribeActive = null;
+        maybeFinalize();
+        return;
+      }
+      const itemId = /** @type {string} */ (transcribeQueue.shift());
+      const item = getItem(itemId);
+      if (!item) {
+        startNextTranscription();
+        return;
+      }
+      transcribeActive = itemId;
+      queueCurrentItemId = itemId;
+      patchItem(itemId, { status: 'transcribing', streamSegments: [] });
+      jobInvoke('update_item_phase', { itemId, phase: 'transcribing', downloadPath: null }).catch(() => {});
+      jobInvoke('transcribe_item', {
+        itemId,
+        audioPath: item.downloadPath,
+        model: job.model,
+        timestamps: job.timestamps,
+      }).catch((/** @type {unknown} */ e) => {
+        // Spawn itself failed (e.g. sidecar binary missing) — the
+        // transcribe-progress listener never fires for this item, so handle
+        // the failure here instead of leaving it stuck on 'transcribing'.
+        handleTranscribeError(itemId, { code: null, message: String(e) });
+      });
+    }
 
-    if (event === 'phase') {
-      if (payload.phase === 'starting') {
-        currentJob.items[itemIndex] = { ...item, status: 'starting' };
-      } else if (payload.phase === 'downloading' || payload.phase === 'downloading-model') {
-        currentJob.items[itemIndex] = { ...item, status: 'downloading' };
-      } else if (payload.phase === 'downloading-audio') {
-        currentJob.items[itemIndex] = {
-          ...item,
-          status: 'downloading',
-          downloadPercent: typeof payload.percent === 'number' ? payload.percent : item.downloadPercent ?? null,
-          downloadedBytes: payload.downloaded_bytes ?? item.downloadedBytes ?? null,
-          totalBytes: payload.total_bytes ?? item.totalBytes ?? null,
-          speedBps: payload.speed_bps ?? null,
-          etaSecs: payload.eta_secs ?? null,
-        };
-      } else if (payload.phase === 'transcribing') {
-        currentJob.items[itemIndex] = { ...item, status: 'transcribing', streamSegments: item.streamSegments || [] };
-      }
-      currentJob = { ...currentJob };
-    } else if (event === 'progress') {
-      if (payload.phase === 'transcribing' && payload.text) {
-        const segs = [...(item.streamSegments || []), { index: payload.segment ?? (item.streamSegments || []).length, text: payload.text, start: payload.start ?? 0, end: payload.end ?? 0, ts: payload.ts, displayed: payload.text }];
-        currentJob.items[itemIndex] = { ...item, status: 'transcribing', streamSegments: segs };
-        currentJob = { ...currentJob };
-      }
-    } else if (event === 'result') {
+    /** @param {string} itemId @param {any} payload */
+    function handleTranscribeResult(itemId, payload) {
+      const item = getItem(itemId);
+      if (!item || item.status === 'done') return; // already handled / cancelled
       const wordCount = getWordCount(payload.plain || '');
-      const transcriptResult = { language: payload.language, plain: payload.plain, timestamped: payload.timestamped, srt: payload.srt };
-      // Compute actual audio duration from the last streamed segment's end time;
-      // probe-reported duration is often 0 for yt-dlp URLs that skip headers.
       const audioDuration = (item.streamSegments || []).reduce((max, seg) => Math.max(max, seg.end || 0), 0);
-      currentJob.items[itemIndex] = {
-        ...item,
+      patchItem(itemId, {
         status: 'done',
-        result: transcriptResult,
+        result: { language: payload.language, plain: payload.plain, timestamped: payload.timestamped, srt: payload.srt },
         wordCount,
         audioDuration,
         completedAt: new Date().toISOString(),
-      };
-      currentJob = { ...currentJob };
+      });
+      jobInvoke('update_item_result', {
+        itemId,
+        result: {
+          language: payload.language,
+          plain: payload.plain,
+          timestamped: payload.timestamped,
+          srt: payload.srt,
+          word_count: wordCount,
+        },
+      }).catch((/** @type {unknown} */ e) => console.warn('pipeline: update_item_result failed:', e));
 
-      // Save individual transcript to history
-      if (invokeFn) {
-        invokeFn('save_transcript', {
-          record: {
-            url: item.url,
-            title: item.title,
-            language: payload.language,
-            plain: payload.plain,
-            timestamped: payload.timestamped,
-            srt: payload.srt,
-            model: currentJob.model,
-            word_count: wordCount,
-          },
+      jobInvoke('save_transcript', {
+        record: {
+          url: item.url,
+          title: item.title,
+          language: payload.language,
+          plain: payload.plain,
+          timestamped: payload.timestamped,
+          srt: payload.srt,
+          model: job.model,
+          word_count: wordCount,
+        },
+      })
+        .then((/** @type {string} */ id) => {
+          historyRecords = [
+            { id, url: item.url, title: item.title, language: payload.language, plain: payload.plain, timestamped: payload.timestamped, srt: payload.srt, model: job.model, word_count: wordCount, created_at: new Date().toISOString() },
+            ...historyRecords,
+          ];
         })
-          .then((id) => {
-            historyRecords = [
-              { id, url: item.url, title: item.title, language: payload.language, plain: payload.plain, timestamped: payload.timestamped, srt: payload.srt, model: currentJob.model, word_count: wordCount, created_at: new Date().toISOString() },
-              ...historyRecords,
-            ];
-          })
-          .catch((e) => console.warn('queue: save_transcript failed:', e));
-      }
-    } else if (event === 'error') {
-      // Don't overwrite a completed transcription — cleanup errors that
-      // arrive after the result event are non-fatal (e.g. tmpdir rmtree
-      // failure, or a PyInstaller multiprocessing child running main()).
-      if (item.status === 'done') return;
-      // Store the raw sidecar message so History can show the actual reason.
-      currentJob.items[itemIndex] = {
-        ...item,
+        .catch((/** @type {unknown} */ e) => console.warn('pipeline: save_transcript failed:', e));
+
+      transcribeActive = null;
+      startNextTranscription();
+    }
+
+    /** @param {string} itemId @param {any} payload */
+    function handleTranscribeError(itemId, payload) {
+      const item = getItem(itemId);
+      if (!item || item.status === 'done') return;
+      patchItem(itemId, {
         status: 'failed',
         error: payload.message || queueErrorMessage(payload.code, ''),
         errorCode: payload.code,
         completedAt: new Date().toISOString(),
-      };
-      currentJob = { ...currentJob };
-    } else if (event === 'terminated') {
-      // Don't overwrite 'done' or 'failed' — those were set by result/error events.
-      if (item.status !== 'done' && item.status !== 'failed') {
-        currentJob.items[itemIndex] = { ...item, status: 'cancelled', completedAt: new Date().toISOString() };
-        currentJob = { ...currentJob };
+      });
+      jobInvoke('update_item_error', {
+        itemId,
+        errorCode: payload.code || 'INTERNAL',
+        errorMessage: payload.message || '',
+      }).catch((/** @type {unknown} */ e) => console.warn('pipeline: update_item_error failed:', e));
+
+      if (transcribeActive === itemId) {
+        transcribeActive = null;
+        startNextTranscription();
       }
     }
+
+    // ── transcribe-progress listener — routes by payload.item_id ──────────
+    if (listenFn) {
+      if (queueUnlisten) { try { queueUnlisten(); } catch {} }
+      try {
+        queueUnlisten = await listenFn('transcribe-progress', (/** @type {any} */ event) => {
+          const payload = event.payload;
+          if (!payload || typeof payload !== 'object') return;
+          const itemId = payload.item_id ?? transcribeActive;
+          if (!itemId) return;
+          logActivity(payload);
+          if (payload.event === 'phase' && payload.phase === 'transcribing') {
+            patchItem(itemId, { status: 'transcribing', streamSegments: getItem(itemId)?.streamSegments || [] });
+          } else if (payload.event === 'progress' && payload.phase === 'transcribing' && payload.text) {
+            const item = getItem(itemId);
+            const segs = [...(item?.streamSegments || []), { index: payload.segment ?? (item?.streamSegments || []).length, text: payload.text, start: payload.start ?? 0, end: payload.end ?? 0, ts: payload.ts, displayed: payload.text }];
+            patchItem(itemId, { streamSegments: segs });
+          } else if (payload.event === 'result') {
+            handleTranscribeResult(itemId, payload);
+          } else if (payload.event === 'error') {
+            handleTranscribeError(itemId, payload);
+          } else if (payload.event === 'terminated') {
+            // A "Skip →" cancel kills the sidecar; if no result/error event
+            // got there first, this is what marks the item cancelled and
+            // frees the transcription slot for the next queued item.
+            const item = getItem(itemId);
+            if (item && item.status !== 'done' && item.status !== 'failed') {
+              patchItem(itemId, { status: 'cancelled', completedAt: new Date().toISOString() });
+              jobInvoke('update_item_error', { itemId, errorCode: 'CANCELLED', errorMessage: '' }).catch(() => {});
+            }
+            if (transcribeActive === itemId) {
+              transcribeActive = null;
+              startNextTranscription();
+            }
+          }
+        });
+      } catch (e) {
+        console.warn('pipeline: failed to subscribe to transcribe-progress:', e);
+      }
+    }
+
+    // ── download-progress listener — routes by payload.item_id ────────────
+    /** @type {Map<string, () => void>} resolves each item's download-chunk wait once it reaches a terminal outcome. */
+    const downloadDone = new Map();
+    /** @type {(() => void) | null} */
+    let downloadUnlisten = null;
+    if (listenFn) {
+      try {
+        downloadUnlisten = await listenFn('download-progress', (/** @type {any} */ event) => {
+          const payload = event.payload;
+          if (!payload || typeof payload !== 'object' || !payload.item_id) return;
+          const itemId = payload.item_id;
+          logActivity(payload);
+          if (payload.event === 'phase') {
+            if (payload.phase === 'downloading' || payload.phase === 'downloading-audio') {
+              patchItem(itemId, {
+                status: 'downloading',
+                downloadPercent: typeof payload.percent === 'number' ? payload.percent : getItem(itemId)?.downloadPercent ?? null,
+                downloadedBytes: payload.downloaded_bytes ?? getItem(itemId)?.downloadedBytes ?? null,
+                totalBytes: payload.total_bytes ?? getItem(itemId)?.totalBytes ?? null,
+                speedBps: payload.speed_bps ?? null,
+                etaSecs: payload.eta_secs ?? null,
+              });
+            }
+          } else if (payload.event === 'download-done') {
+            patchItem(itemId, { status: 'downloaded', downloadPath: payload.path });
+            // Rust's download_item already wrote phase="downloaded" + path
+            // directly to the DB on this event — no update_item_phase call
+            // needed here, just enqueue for transcription.
+            transcribeQueue.push(itemId);
+            if (transcribeActive === null) startNextTranscription();
+            downloadDone.get(itemId)?.();
+          } else if (payload.event === 'error') {
+            const item = getItem(itemId);
+            if (item && item.status !== 'done') {
+              patchItem(itemId, {
+                status: 'failed',
+                error: payload.message || queueErrorMessage(payload.code, ''),
+                errorCode: payload.code,
+                completedAt: new Date().toISOString(),
+              });
+              jobInvoke('update_item_error', { itemId, errorCode: payload.code || 'INTERNAL', errorMessage: payload.message || '' }).catch(() => {});
+            }
+            downloadDone.get(itemId)?.();
+          } else if (payload.event === 'terminated') {
+            // "Skip →" on a downloading row, or cancel_download's kill.
+            const item = getItem(itemId);
+            if (item && item.status !== 'done' && item.status !== 'failed' && item.status !== 'cancelled') {
+              patchItem(itemId, { status: 'cancelled', completedAt: new Date().toISOString() });
+              jobInvoke('update_item_error', { itemId, errorCode: 'CANCELLED', errorMessage: '' }).catch(() => {});
+            }
+            downloadDone.get(itemId)?.();
+          }
+        });
+      } catch (e) {
+        console.warn('pipeline: failed to subscribe to download-progress:', e);
+      }
+    }
+
+    function maybeFinalize() {
+      if (!downloadRunnerDone) return;
+      if (transcribeQueue.length > 0 || transcribeActive !== null) return;
+      finishPipelineJob();
+    }
+
+    async function finishPipelineJob() {
+      if (queueUnlisten) { try { queueUnlisten(); queueUnlisten = null; } catch {} }
+      if (downloadUnlisten) { try { downloadUnlisten(); } catch {} }
+      queueCurrentItemId = null;
+      queueActive = false;
+      currentJob = { ...job };
+      await finalizePipelineJob();
+    }
+
+    // ── download runner: chunks of DOWNLOAD_CHUNK_SIZE, sequential between chunks ──
+    // Items already terminal (done/failed/cancelled, e.g. on resume) are
+    // skipped; already-`downloaded` items (resume) skip straight to the
+    // transcription queue without a chunk slot.
+    for (const item of job.items) {
+      if (item.status === 'downloaded') {
+        transcribeQueue.push(item.id);
+      }
+    }
+    if (transcribeQueue.length > 0 && transcribeActive === null) startNextTranscription();
+
+    const pendingDownload = job.items.filter(
+      (i) => i.status === 'waiting' || i.status === 'downloading'
+    );
+    // Resumed mid-download items are reset to waiting — their partial file
+    // was never confirmed complete, so they re-download from scratch.
+    for (const item of pendingDownload) {
+      if (item.status === 'downloading') patchItem(item.id, { status: 'waiting' });
+    }
+
+    for (let start = 0; start < pendingDownload.length; start += DOWNLOAD_CHUNK_SIZE) {
+      if (jobCancelRequested) break;
+      const chunk = pendingDownload.slice(start, start + DOWNLOAD_CHUNK_SIZE);
+      const waits = chunk.map(
+        (item) =>
+          new Promise((resolve) => {
+            downloadDone.set(item.id, () => resolve(undefined));
+          })
+      );
+      for (const item of chunk) {
+        patchItem(item.id, { status: 'downloading', startedAt: new Date().toISOString() });
+        jobInvoke('update_item_phase', { itemId: item.id, phase: 'downloading', downloadPath: null }).catch(() => {});
+        jobInvoke('download_item', { jobId: job.id, itemId: item.id, url: item.url }).catch((/** @type {unknown} */ e) => {
+          const cur = getItem(item.id);
+          if (cur && cur.status !== 'done') {
+            patchItem(item.id, {
+              status: 'failed',
+              error: queueErrorMessage(null, String(e)),
+              completedAt: new Date().toISOString(),
+            });
+          }
+          downloadDone.get(item.id)?.();
+        });
+      }
+      await Promise.all(waits);
+      for (const item of chunk) downloadDone.delete(item.id);
+    }
+
+    downloadRunnerDone = true;
+    maybeFinalize();
   }
 
-  async function finalizeJob() {
+  async function finalizePipelineJob() {
     if (!currentJob || !invokeFn) return;
-    const now = new Date().toISOString();
     const start = new Date(currentJob.createdAt).getTime();
     const elapsedMs = Date.now() - start;
     const successCount = currentJob.items.filter((i) => i.status === 'done').length;
@@ -537,59 +861,98 @@
     const totalWords = currentJob.items.reduce((s, i) => s + (i.wordCount || 0), 0);
     const totalAudioSecs = currentJob.items.filter((i) => i.status === 'done').reduce((s, i) => s + (i.audioDuration || i.duration || 0), 0);
 
-    const jobRecord = {
-      id: currentJob.id,
-      model: currentJob.model,
-      timestamps: currentJob.timestamps,
-      created_at: currentJob.createdAt,
-      completed_at: now,
-      elapsed_ms: elapsedMs,
-      total_items: currentJob.items.length,
-      success_count: successCount,
-      failure_count: failureCount,
-      cancelled_count: cancelledCount,
-      total_words: totalWords,
-      total_audio_secs: totalAudioSecs,
-      items: currentJob.items.map((item) => ({
-        id: item.id,
-        url: item.url,
-        title: item.title,
-        thumbnail: item.thumbnail,
-        duration_secs: item.duration || 0,
-        status: item.status,
-        error_code: item.errorCode || null,
-        error_message: item.error || null,
-        language: item.result?.language || null,
-        plain: item.result?.plain || null,
-        timestamped: item.result?.timestamped || null,
-        srt: item.result?.srt || null,
-        word_count: item.wordCount || null,
-        started_at: item.startedAt || null,
-        completed_at: item.completedAt || null,
-        elapsed_ms: item.startedAt && item.completedAt
-          ? new Date(item.completedAt).getTime() - new Date(item.startedAt).getTime()
-          : null,
-        download_percent: typeof item.downloadPercent === 'number' ? item.downloadPercent : null,
-        downloaded_bytes: typeof item.downloadedBytes === 'number' ? item.downloadedBytes : null,
-        total_bytes: typeof item.totalBytes === 'number' ? item.totalBytes : null,
-      })),
-    };
-
     try {
-      await invokeFn('save_job', { job: jobRecord });
-      jobs = [jobRecord, ...jobs];
+      await invokeFn('finalize_job', {
+        jobId: currentJob.id,
+        stats: {
+          elapsed_ms: elapsedMs,
+          success_count: successCount,
+          failure_count: failureCount,
+          cancelled_count: cancelledCount,
+          total_words: totalWords,
+          total_audio_secs: totalAudioSecs,
+        },
+      });
+      jobs = [
+        {
+          id: currentJob.id,
+          model: currentJob.model,
+          timestamps: currentJob.timestamps,
+          created_at: currentJob.createdAt,
+          completed_at: new Date().toISOString(),
+          elapsed_ms: elapsedMs,
+          total_items: currentJob.items.length,
+          success_count: successCount,
+          failure_count: failureCount,
+          cancelled_count: cancelledCount,
+          total_words: totalWords,
+          total_audio_secs: totalAudioSecs,
+          items: currentJob.items.map((item) => ({
+            id: item.id,
+            url: item.url,
+            title: item.title,
+            thumbnail: item.thumbnail,
+            duration_secs: item.duration || 0,
+            status: item.status,
+            error_code: item.errorCode || null,
+            error_message: item.error || null,
+            language: item.result?.language || null,
+            plain: item.result?.plain || null,
+            timestamped: item.result?.timestamped || null,
+            srt: item.result?.srt || null,
+            word_count: item.wordCount || null,
+            started_at: item.startedAt || null,
+            completed_at: item.completedAt || null,
+            elapsed_ms: item.startedAt && item.completedAt
+              ? new Date(item.completedAt).getTime() - new Date(item.startedAt).getTime()
+              : null,
+            download_percent: typeof item.downloadPercent === 'number' ? item.downloadPercent : null,
+            downloaded_bytes: typeof item.downloadedBytes === 'number' ? item.downloadedBytes : null,
+            total_bytes: typeof item.totalBytes === 'number' ? item.totalBytes : null,
+          })),
+        },
+        ...jobs,
+      ];
     } catch (e) {
-      console.warn('queue: save_job failed:', e);
+      console.warn('pipeline: finalize_job failed:', e);
     }
   }
 
+  /**
+   * "Cancel job" (top right) — F13 tier 3: cancel every non-terminal item
+   * (waiting, downloading, downloaded-awaiting-transcription, transcribing)
+   * and kill whatever sidecars are currently running. The pipeline runner's
+   * own event handlers (download-progress/transcribe-progress `terminated`)
+   * already advance past a killed item, so this doesn't need to await the
+   * runner — it naturally winds down and calls finalizePipelineJob once
+   * every item is terminal.
+   */
   async function cancelQueueJob() {
     if (!currentJob) return;
+    // Tell the runner's chunk loop / transcription-queue drain to stop
+    // starting anything new. Without this, items still `waiting` (not yet
+    // handed to a sidecar) would have no listener to catch this
+    // cancellation — the runner would plow ahead and spawn them anyway.
+    jobCancelRequested = true;
+    const nonTerminal = currentJob.items.filter((i) =>
+      ['waiting', 'downloading', 'downloaded', 'transcribing'].includes(i.status)
+    );
     currentJob.items = currentJob.items.map((item) =>
-      item.status === 'waiting' ? { ...item, status: 'cancelled' } : item
+      ['waiting', 'downloading', 'downloaded', 'transcribing'].includes(item.status)
+        ? { ...item, status: 'cancelled', completedAt: new Date().toISOString() }
+        : item
     );
     currentJob = { ...currentJob };
     if (invokeFn) {
+      for (const item of nonTerminal) {
+        if (item.status === 'downloading') {
+          invokeFn('cancel_download', { jobId: currentJob.id, itemId: item.id }).catch(() => {});
+        } else {
+          // waiting/downloaded items have no sidecar to kill — persist the
+          // cancellation directly so the DB matches what the UI now shows.
+          invokeFn('update_item_error', { itemId: item.id, errorCode: 'CANCELLED', errorMessage: '' }).catch(() => {});
+        }
+      }
       try { await invokeFn('cancel_transcribe'); } catch {}
     }
     queueActive = false;
@@ -609,6 +972,7 @@
       startedAt: null,
       completedAt: null,
       streamSegments: [],
+      downloadPath: null,
       downloadPercent: null,
       downloadedBytes: null,
       totalBytes: null,
@@ -617,42 +981,63 @@
     };
     currentJob = { ...currentJob };
     queueActive = true;
-    runQueueLoop();
+    if (invokeFn) {
+      invokeFn('update_item_phase', { itemId, phase: 'waiting', downloadPath: null }).catch(() => {});
+    }
+    runPipelineJob(true);
   }
 
-  /** @param {string} itemId */
+  /**
+   * F13 tiers 1+2+3 collapsed into one handler, dispatched by the item's
+   * current phase:
+   *   - waiting/downloaded: not actively running anything — mark cancelled
+   *     locally only (downloaded also means a file is sitting in
+   *     downloads/<job_id>/, harmless until finalize_job's cleanup).
+   *   - downloading: "Skip →" tier 1 — cancel_download(item_id) kills only
+   *     that item's sidecar, the other up-to-4 downloads in its chunk
+   *     continue unaffected.
+   *   - transcribing: "Skip →" tier 2 — cancel_transcribe() kills the
+   *     single transcription slot; the pipeline's terminated handler
+   *     advances to the next queued item automatically.
+   * @param {string} itemId
+   */
   async function cancelQueueItem(itemId) {
     if (!currentJob) return;
     const item = currentJob.items.find((i) => i.id === itemId);
     if (!item) return;
 
-    if (item.status === 'waiting') {
-      // Pending item — just mark cancelled, no sidecar running for it.
+    if (item.status === 'waiting' || item.status === 'downloaded') {
       currentJob.items = currentJob.items.map((it) =>
         it.id === itemId ? { ...it, status: 'cancelled', completedAt: new Date().toISOString() } : it
       );
       currentJob = { ...currentJob };
+      if (invokeFn) {
+        invokeFn('update_item_error', { itemId, errorCode: 'CANCELLED', errorMessage: '' }).catch(() => {});
+      }
       return;
     }
 
-    if (item.status === 'starting' || item.status === 'downloading' || item.status === 'transcribing') {
-      // Active item — mark it cancelled locally, kill the sidecar, then
-      // finalise the job so the cancelled status is persisted to history.
-      // The sidecar's `terminated` event will also mark the item cancelled
-      // when it arrives, but we don't want to wait for it to update the UI.
+    if (item.status === 'downloading') {
       currentJob.items = currentJob.items.map((it) =>
-        it.id === itemId
-          ? { ...it, status: 'cancelled', completedAt: new Date().toISOString() }
-          : it
+        it.id === itemId ? { ...it, status: 'cancelled', completedAt: new Date().toISOString() } : it
       );
       currentJob = { ...currentJob };
+      if (invokeFn) {
+        try { await invokeFn('cancel_download', { jobId: currentJob.id, itemId }); } catch {}
+      }
+      return;
+    }
 
+    if (item.status === 'transcribing') {
+      currentJob.items = currentJob.items.map((it) =>
+        it.id === itemId ? { ...it, status: 'cancelled', completedAt: new Date().toISOString() } : it
+      );
+      currentJob = { ...currentJob };
       if (invokeFn) {
         try { await invokeFn('cancel_transcribe'); } catch {}
       }
-      // Note: the runner is still mid-loop waiting for run_sidecar to
-      // resolve. We don't abort the loop — it will pick up the next item
-      // (or hit the `terminated` event and exit cleanly).
+      // The pipeline's transcribe-progress 'terminated' handler frees the
+      // slot and calls startNextTranscription() once this kill lands.
     }
   }
 
@@ -696,6 +1081,14 @@
   /** @type {any | null} */
   let selectedHistoryRecord = null;
 
+  /**
+   * URLs already transcribed, derived from history. Passed down to the
+   * picker so it can grey out rows the user would otherwise re-queue by
+   * accident. Matched by exact URL — see F12 spec section B.
+   * @type {Set<string>}
+   */
+  $: transcribedUrls = new Set(historyRecords.map((r) => r.url).filter(Boolean));
+
   /** Number of videos currently selected in the picker (kept in sync via bind) */
   let pickerSelectedCount = 0;
 
@@ -711,8 +1104,23 @@
   /**
    * Single-video transcription routed through the queue (like batch).
    * Replaces the old direct `transcribe()` call for the desktop app.
+   *
+   * Guarded against `activeView === 'picker'`: the global ⌘↩ shortcut (see
+   * KeyboardShortcuts below) calls this unconditionally, and without this
+   * guard it would fall back to a single job item using the raw
+   * channel/playlist URL as both url and title (F12 spec section C — the
+   * actual root cause of "Problem C"). In picker mode, the picker's own
+   * "Transcribe N videos →" buttons (footer and inline) are the only
+   * correct way to start a job.
    */
   function handleTranscribeViaQueue() {
+    if (activeView === 'picker') return;
+    // A probe is debounced/in-flight for the current URL — it may yet
+    // resolve to a playlist/channel. Don't enqueue the raw, unprobed URL
+    // as a fake single video; the user can retry once the probe settles
+    // (see F12 spec section C — this was the actual root cause of jobs
+    // with the bare channel/playlist URL as both url and title).
+    if (probeState === 'probing') return;
     const trimmed = url.trim();
     if (!trimmed) return;
 
@@ -785,11 +1193,6 @@
     startBatchJob([entry]);
   }
 
-  /** Called when the user clicks "Transcribe X videos" in picker mode */
-  function handleTranscribePicker() {
-    // Primary path is via VideoPicker startJob event.
-  }
-
   /** @param {CustomEvent} e */
   function handleStartJob(e) {
     const selected = e.detail.selected;
@@ -830,6 +1233,7 @@
         startedAt: null,
         completedAt: null,
         wordCount: null,
+        downloadPath: null,
         downloadPercent: null,
         downloadedBytes: null,
         totalBytes: null,
@@ -840,7 +1244,7 @@
     };
     queueActive = true;
     activeView = 'queue';
-    runQueueLoop();
+    runPipelineJob();
   }
 
   /** Open a completed queue item's transcript in the History tab. */
@@ -921,7 +1325,7 @@
   async function handleDeleteJob(jobId) {
     if (!invokeFn) return;
     try {
-      await invokeFn('delete_job', { job_id: jobId });
+      await invokeFn('delete_job', { jobId });
       jobs = jobs.filter((j) => j.id !== jobId);
     } catch (e) {
       console.warn('delete_job failed:', e);
@@ -993,7 +1397,7 @@
     let unlisten = null;
     if (invokeFn && listenFn) {
       try {
-        unlisten = await listenFn('transcribe-progress', (event) => {
+        unlisten = await listenFn('transcribe-progress', (/** @type {any} */ event) => {
           handleSidecarEvent(event.payload);
           logActivity(event.payload);
         });
@@ -1271,7 +1675,23 @@
   {#if isTauri}
   <!-- ─── Desktop app shell ─────────────────────────── -->
   <div class="desktop-shell">
-    <SidebarNav {activeView} {queueActive} {darkMode} on:navigate={handleSidebarNavigate} on:toggle-theme={handleSidebarThemeToggle} />
+    <div class="sidebar-col">
+      <SidebarNav {activeView} {queueActive} {darkMode} on:navigate={handleSidebarNavigate} on:toggle-theme={handleSidebarThemeToggle} />
+      {#if resumeBannerJob}
+        {@const resumableCount = resumeBannerJob.items.filter((/** @type {any} */ i) => ['waiting', 'downloading', 'downloaded'].includes(i.phase)).length}
+        <div class="resume-banner">
+          <span class="resume-banner-icon" aria-hidden="true">↩</span>
+          <div class="resume-banner-text">
+            <p class="resume-banner-title">Resume unfinished job?</p>
+            <p class="resume-banner-desc">{resumableCount} video{resumableCount === 1 ? '' : 's'} still pending from earlier</p>
+          </div>
+          <div class="resume-banner-actions">
+            <button type="button" class="resume-banner-btn primary" on:click={handleResumeJob}>Resume</button>
+            <button type="button" class="resume-banner-btn" on:click={handleDiscardJob}>Discard</button>
+          </div>
+        </div>
+      {/if}
+    </div>
     <div class="desktop-main">
       <div class="page-title">
         {#if activeView === 'transcribe' || activeView === 'picker'}
@@ -1313,19 +1733,20 @@
               {phase}
               {model}
               {invokeFn}
+              {listenFn}
               modelProgress={modelDownloadProgress}
               language={result?.language}
               errorMessage={error}
               {activeView}
               pickerMode={activeView === 'picker'}
               selectedCount={pickerSelectedCount}
+              {transcribedUrls}
               {duplicateMatch}
               on:transcribe={handleTranscribeViaQueue}
               on:cancel={cancelTranscription}
               on:playlist={handlePlaylistDetected}
               on:startJob={handleStartJob}
               on:goSettings={() => (activeView = 'settings')}
-              on:transcribePicker={handleTranscribePicker}
               on:viewDuplicate={viewDuplicate}
               on:forceTranscribe={forceTranscribe}
             />
@@ -1368,6 +1789,7 @@
               bind:darkMode
               historyCount={historyRecords.length}
               historySizeBytes={historyRecords.reduce((sum, r) => sum + (r.plain?.length ?? 0) + (r.srt?.length ?? 0) + (r.timestamped?.length ?? 0), 0)}
+              {invokeFn}
               on:change={handleSettingsChange}
               on:clearHistory={handleClearHistory}
             />
@@ -1781,12 +2203,18 @@
     --error-border: rgba(244, 165, 165, 0.18);
   }
 
+  :global(html), :global(body) {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+  }
+
   :global(body) {
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
     font-feature-settings: 'cv11', 'ss01', 'ss03';
     font-size: 15px;
     line-height: 1.65;
-    min-height: 100vh;
     background: var(--bg-base);
     color: var(--text);
     -webkit-font-smoothing: antialiased;
@@ -1797,12 +2225,13 @@
   /* ─── App shell ───────────────────────────────────── */
   .app {
     position: relative;
-    min-height: 100vh;
+    height: 100vh;
+    height: 100dvh;
     display: flex;
     flex-direction: column;
     background: var(--bg-base);
     color: var(--text);
-    overflow-x: hidden;
+    overflow: hidden;
     transition: background 0.4s ease, color 0.4s ease;
   }
 
@@ -1929,14 +2358,88 @@
 
   .desktop-shell {
     display: flex;
-    min-height: 100vh;
+    flex: 1;
+    min-height: 0;
     width: 100%;
+    overflow: hidden;
+  }
+  .sidebar-col {
+    width: 220px;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+  .sidebar-col :global(.sidebar-nav) {
+    flex: 1;
+    min-height: 0;
+  }
+  .resume-banner {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin: 0 12px 14px;
+    padding: 12px 12px 10px;
+    background: var(--surface-2);
+    border: 1px solid var(--glass-border-soft);
+    border-radius: 10px;
+    flex-shrink: 0;
+  }
+  .resume-banner-icon {
+    font-size: 14px;
+    color: var(--accent);
+  }
+  .resume-banner-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .resume-banner-title {
+    margin: 0;
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--text);
+  }
+  .resume-banner-desc {
+    margin: 0;
+    font-size: 11.5px;
+    color: var(--text-3);
+  }
+  .resume-banner-actions {
+    display: flex;
+    gap: 6px;
+  }
+  .resume-banner-btn {
+    flex: 1;
+    background: var(--surface-3);
+    border: 1px solid var(--glass-border-soft);
+    border-radius: 6px;
+    font-family: inherit;
+    font-size: 11.5px;
+    font-weight: 500;
+    color: var(--text-2);
+    padding: 6px 8px;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+  }
+  .resume-banner-btn:hover {
+    background: var(--surface-1);
+    color: var(--text);
+  }
+  .resume-banner-btn.primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--accent-fg);
+  }
+  .resume-banner-btn.primary:hover {
+    background: var(--accent-hover);
   }
   .desktop-main {
     flex: 1;
     display: flex;
     flex-direction: column;
     min-width: 0;
+    min-height: 0;
   }
   .page-title {
     font-size: 13px;

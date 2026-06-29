@@ -1,0 +1,6 @@
+{
+  "activeJoins": [],
+  "openCheckpoints": [],
+  "blockers": [],
+  "_note": "Managed by agents during sessions. See .rna/rna-schema.json joiningPatterns[] for available pipelines."
+}

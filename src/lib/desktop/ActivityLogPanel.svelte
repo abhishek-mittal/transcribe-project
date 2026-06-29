@@ -12,6 +12,8 @@
    * @typedef {{ id: number, ts: string, severity: Severity, message: string }} LogEntry
    */
 
+  import { onMount } from 'svelte';
+
   /** @type {LogEntry[]} */
   export let entries = [];
 
@@ -23,10 +25,20 @@
   /** Set when the user scrolls up; cleared by the Jump button. */
   let userScrolledUp = false;
 
+  // Track which entry IDs existed on initial mount so we can skip animating them.
+  let mountedEntryIds = /** @type {Set<number>} */ (new Set());
+  let mounted = false;
+  onMount(() => {
+    mounted = true;
+    mountedEntryIds = new Set(entries.map((e) => e.id));
+  });
+
   // Reactive: when new entries arrive and we're pinned, scroll the panel.
-  $: if (entries && stickToBottom && scrollerEl) {
-    // Defer to next tick so the DOM has updated with the new row.
-    queueMicrotask(() => {
+  // Guard with `mounted` to skip the initial render, and use rAF (runs after
+  // browser layout) instead of queueMicrotask (runs before layout) so that
+  // scrollHeight access doesn't force a synchronous layout in WKWebView.
+  $: if (mounted && entries.length > 0 && stickToBottom && scrollerEl) {
+    requestAnimationFrame(() => {
       if (scrollerEl) {
         scrollerEl.scrollTop = scrollerEl.scrollHeight;
       }
@@ -104,6 +116,7 @@
         {#each entries as entry (entry.id)}
           <li
             class="al-row"
+            class:al-row-animated={mounted && !mountedEntryIds.has(entry.id)}
             class:al-row-success={entry.severity === 'success'}
             class:al-row-error={entry.severity === 'error'}
             class:al-row-warn={entry.severity === 'warn'}
@@ -227,9 +240,11 @@
     align-items: baseline;
     padding: 2px 12px;
     color: var(--text-2);
-    /* Per-row reveal: fade + slight slide from the top. */
-    animation: al-row-in 180ms ease-out both;
     border-left: 2px solid transparent;
+  }
+  /* Only animate rows that arrive after the initial mount batch. */
+  .al-row.al-row-animated {
+    animation: al-row-in 180ms ease-out both;
   }
   /* Severity stripes — solid 2px left edge in the severity color, but only
      for non-default severities to keep the panel calm by default. */
@@ -248,7 +263,7 @@
     }
   }
   @media (prefers-reduced-motion: reduce) {
-    .al-row { animation: none; }
+    .al-row.al-row-animated { animation: none; }
     .al-jump { transition: none; }
   }
 

@@ -194,6 +194,125 @@ def _is_instagram_url(url: str) -> bool:
     return _host_of(url) in _INSTAGRAM_HOSTS
 
 
+_INSTAGRAM_POST_KEYWORDS = {"reel", "reels", "p", "tv", "stories"}
+
+
+def _is_instagram_profile_url(url: str) -> bool:
+    """Return True for IG profile/listing pages, False for individual posts/reels.
+
+    Profile/listing: instagram.com/username/, instagram.com/username/reels (no id).
+    Individual:      instagram.com/reel/<id>, instagram.com/p/<id>,
+                      instagram.com/<username>/reel/<id> (IG's own share links
+                      now prefix individual post URLs with the username, so the
+                      post keyword isn't always segment[0]).
+    """
+    if not _is_instagram_url(url):
+        return False
+    try:
+        path = urlparse(url).path.strip("/")
+    except ValueError:
+        return False
+    segments = [s for s in path.split("/") if s]
+    if not segments:
+        return True
+    # An individual post/reel/story always has a known keyword segment
+    # immediately followed by an id segment, whether or not it's prefixed
+    # by the username (instagram.com/reel/<id> or instagram.com/<user>/reel/<id>).
+    for segment in segments[:-1]:
+        if segment.lower() in _INSTAGRAM_POST_KEYWORDS:
+            return False
+    return True
+
+
+def _ig_cookies_file_path() -> str:
+    """Return the well-known per-platform path for the Instagram cookies file.
+
+    Users export a Netscape cookies file (e.g. via the 'Get cookies.txt LOCALLY'
+    Chrome extension) and drop it here.  The app picks it up automatically —
+    same pattern as the server-side IG_DLP_COOKIES_FILE env var.
+
+    macOS:   ~/Library/Application Support/com.shuhari.transcribe/instagram_cookies.txt
+    Windows: %APPDATA%\\com.shuhari.transcribe\\instagram_cookies.txt
+    Linux:   ~/.local/share/com.shuhari.transcribe/instagram_cookies.txt
+    """
+    import platform
+
+    home = os.path.expanduser("~")
+    app_id = "com.shuhari.transcribe"
+    system = platform.system()
+    if system == "Darwin":
+        return os.path.join(home, "Library", "Application Support", app_id, "instagram_cookies.txt")
+    if system == "Windows":
+        appdata = os.environ.get("APPDATA", os.path.join(home, "AppData", "Roaming"))
+        return os.path.join(appdata, app_id, "instagram_cookies.txt")
+    xdg = os.environ.get("XDG_DATA_HOME", os.path.join(home, ".local", "share"))
+    return os.path.join(xdg, app_id, "instagram_cookies.txt")
+
+
+def _inject_ig_browser_cookies(ydl_opts: dict) -> None:
+    """Inject Instagram session cookies for desktop mode.
+
+    Strategy (in priority order):
+    1. User-placed Netscape cookies file at the standard app-data path —
+       written by the Settings → Instagram "paste cookie header" flow (Rust
+       `save_instagram_cookies`), or manually via a browser extension.
+       Primary, recommended path: always wins if present.
+    2. Live browser session cookies (Safari → Chrome → Firefox on macOS).
+       Best-effort fallback for users who skipped step 1 but happen to be
+       signed into Instagram in one of those browsers. Each candidate's
+       cookie jar is read here (not just configured) so a jar we can't
+       access — e.g. Safari's, which macOS sandboxes behind a TCC
+       permission a bundled PyInstaller binary doesn't have — is skipped
+       instead of crashing the whole download. Without this try/except,
+       `cookiesfrombrowser` would only be *set*, not *validated*, here:
+       yt-dlp would hit the same PermissionError later inside
+       `extract_info`, too late to fall back to the next browser.
+
+    Instagram requires authentication even for "public" reels (server-side
+    enforcement since late 2024) — there is no cookie-free path.
+    """
+    # Strategy 1: explicit cookies file (most reliable)
+    cookies_path = _ig_cookies_file_path()
+    if _is_valid_netscape_cookies(cookies_path):
+        ydl_opts["cookiefile"] = cookies_path
+        logger.info("instagram desktop: using cookies file %s", cookies_path)
+        return
+
+    # Strategy 2: live browser session — actually try each candidate so a
+    # read failure (permission denied, browser not installed, no profile)
+    # falls through to the next one instead of surfacing later as a crash.
+    from yt_dlp.cookies import extract_cookies_from_browser
+
+    import platform
+
+    system = platform.system()
+    candidates: list[str] = {
+        "Darwin":  ["safari", "chrome", "firefox"],
+        "Windows": ["chrome", "edge", "firefox"],
+    }.get(system, ["chrome", "firefox"])
+
+    for browser in candidates:
+        try:
+            jar = extract_cookies_from_browser(browser)
+        except Exception as exc:
+            logger.info(
+                "instagram desktop: could not read %s cookie jar (%s); trying next",
+                browser,
+                exc,
+            )
+            continue
+        if not jar:
+            continue
+        ydl_opts["cookiesfrombrowser"] = (browser,)
+        logger.info("instagram desktop: using live %s session cookies", browser)
+        return
+
+    logger.info(
+        "instagram desktop: no cookies file and no readable browser session; "
+        "proceeding without auth — Instagram will likely reject this request"
+    )
+
+
 def _is_valid_netscape_cookies(path: str) -> bool:
     """Return True only if *path* exists and starts with the Netscape cookie header.
 
@@ -222,6 +341,7 @@ def download_audio(
     *,
     desktop_mode: bool = False,
     progress_callback: Optional[Callable[[dict], None]] = None,
+    ffmpeg_location: Optional[str] = None,
 ) -> str:
     """Download audio from *url* into *output_dir* and return the audio file path.
 
@@ -250,6 +370,15 @@ def download_audio(
 
     Callbacks must be cheap and non-blocking — yt-dlp invokes them on the
     download thread for every progress tick.
+
+    ``ffmpeg_location``, when supplied, is passed straight through to
+    yt-dlp's own ``ffmpeg_location`` option so stream merging/remuxing uses
+    that exact binary instead of yt-dlp's own implicit `PATH` lookup. The
+    Tauri sidecar (``api/sidecar.py``) resolves this via ``resolve_ffmpeg()``
+    — bundled binary when frozen, `PATH` otherwise — and passes the result
+    here so the resolution and the actual usage never diverge. The Flask
+    server path doesn't pass this; it relies on yt-dlp's own PATH lookup
+    exactly as before.
     """
     logger.info(
         "download_audio start url=%s desktop_mode=%s", url, desktop_mode
@@ -278,6 +407,8 @@ def download_audio(
     }
     if node_path:
         ydl_opts["js_runtimes"] = {"node": {"path": node_path}}
+    if ffmpeg_location:
+        ydl_opts["ffmpeg_location"] = ffmpeg_location
 
     if not desktop_mode:
         # The cookies, player-client fallback chain, and PO-token plugin are
@@ -326,9 +457,13 @@ def download_audio(
             ydl_opts["proxy"] = proxy
     else:
         logger.info(
-            "download_audio desktop_mode=True: skipping cookies / PO-token / "
-            "player-client fallback / proxy; using user's residential IP"
+            "download_audio desktop_mode=True: YouTube workarounds skipped; "
+            "using user's residential IP"
         )
+        # Instagram requires session cookies even for public reels on residential
+        # IPs (server-side change, late 2024). Borrow the user's browser session.
+        if is_instagram:
+            _inject_ig_browser_cookies(ydl_opts)
 
     if progress_callback is not None:
         # yt-dlp calls progress_hooks for both the video+audio download and
