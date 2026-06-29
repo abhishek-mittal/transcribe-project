@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import re
 import shutil
 import signal
@@ -33,6 +34,31 @@ import threading
 import time
 import traceback
 from typing import Any
+
+# ---------------------------------------------------------------------------
+# platform.mac_ver() workaround (FIX-10)
+#
+# On some macOS versions, platform.mac_ver()[0] returns a malformed release
+# string (e.g. with an empty/blank dot-separated segment). yt-dlp's plugin
+# discovery (yt_dlp/update.py:_get_variant_and_executable_path, called
+# unconditionally the first time any YoutubeDL() is constructed) parses this
+# string via version_tuple() WITHOUT yt-dlp's own lenient=True option, so
+# int('') raises ValueError -- surfacing as "invalid literal for int() with
+# base 10: ''" on every single transcription/download attempt, regardless
+# of URL. Confirmed via a real traceback captured on an affected M2 Mac.
+# Patched here, before yt_dlp is imported, so it's defensive against
+# whichever code path constructs the first YoutubeDL() instance.
+_real_mac_ver = platform.mac_ver
+
+
+def _safe_mac_ver():
+    release, versioninfo, machine = _real_mac_ver()
+    if not release or any(part == "" for part in release.split(".")):
+        release = "0.0.0"
+    return release, versioninfo, machine
+
+
+platform.mac_ver = _safe_mac_ver
 
 import yt_dlp
 
